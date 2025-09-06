@@ -2,17 +2,18 @@ import socket
 import json
 import threading
 import time
+import os
 from typing import Optional
 
 class OrchestratorComunicator:
     def __init__(self, host='localhost', port=9000, use_websocket=False):
         """
         Initialize the orchestrator communicator
-        
+
         Args:
             host: Host address of the orchestrator
             port: Port number for communication
-            use_websocket: Whether to use WebSocket (lighter) or TCP socket
+            use_websocket: Legacy parameter, currently unused (always uses TCP socket)
         """
         self.host = host
         self.port = port
@@ -23,22 +24,16 @@ class OrchestratorComunicator:
     def _create_connection(self) -> bool:
         """Create socket connection to orchestrator"""
         try:
-            if self.use_websocket:
-                # For WebSocket, we'll use a simple TCP socket with JSON messages
-                # In a real implementation, you might use websockets library
-                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.socket.settimeout(5.0)  # 5 second timeout
-                self.socket.connect((self.host, self.port))
-            else:
-                # Standard TCP socket
-                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.socket.settimeout(5.0)
-                self.socket.connect((self.host, self.port))
-                
+            # Use TCP socket (WebSocket implementation would require websockets library)
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(5.0)
+            self.socket.connect((self.host, self.port))
+
             self.connected = True
             return True
         except Exception as e:
-            print(f"Erro ao conectar ao orquestrador: {e}")
+            if os.getenv('MODO', '').lower() == 'development':
+                print(f"Debug: Erro ao conectar ao orquestrador: {e}")
             self.connected = False
             return False
     
@@ -56,16 +51,22 @@ class OrchestratorComunicator:
     def send_decision(self, decision: str) -> bool:
         """
         Send decision to orchestrator
-        
+
         Args:
             decision: "A" or "B" indicating which traffic light to open
-            
+
         Returns:
             bool: True if message was sent successfully, False otherwise
         """
         if decision not in ["A", "B"]:
-            print(f"Decisão inválida: {decision}. Use 'A' ou 'B'.")
+            if os.getenv('MODO', '').lower() == 'development':
+                print(f"Debug: Decisão inválida: {decision}. Use 'A' ou 'B'.")
             return False
+
+        # In development mode, skip network communication
+        if os.getenv('MODO', '').lower() == 'development':
+            print(f"Debug: Enviando decisão simulada: {decision}")
+            return True
             
         message = json.dumps({
             "decision": decision,
@@ -98,7 +99,8 @@ class OrchestratorComunicator:
             return True
             
         except Exception as e:
-            print(f"Erro ao enviar decisão: {e}")
+            if os.getenv('MODO', '').lower() == 'development':
+                print(f"Debug: Erro ao enviar decisão: {e}")
             self._close_connection()
             return False
     
@@ -120,16 +122,22 @@ class OrchestratorComunicator:
             "timestamp": time.time()
         })
         
+        # In development mode, skip network communication
+        if os.getenv('MODO', '').lower() == 'development':
+            print(f"Debug: Enviando status simulado: A={camera_a_count}, B={camera_b_count}")
+            return True
+
         try:
             if not self.connected:
                 if not self._create_connection():
                     return False
-            
+
             self.socket.sendall(message.encode('utf-8'))
             return True
-            
+
         except Exception as e:
-            print(f"Erro ao enviar status: {e}")
+            if os.getenv('MODO', '').lower() == 'development':
+                print(f"Debug: Erro ao enviar status: {e}")
             self._close_connection()
             return False
     

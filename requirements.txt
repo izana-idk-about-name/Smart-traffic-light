@@ -6,10 +6,10 @@ opencv-python==4.8.1.78
 numpy==1.24.3
 Pillow==10.0.1
 
-# Machine Learning (lightweight for Raspberry Pi)
-# Using scikit-learn instead of TensorFlow for better performance on RPi
-scikit-learn==1.3.0
-joblib==1.3.2
+# AI/ML models
+# Simplified for Python 3.13 compatibility
+opencv-contrib-python==4.8.1.78  # Includes DNN module - already in main requirements
+requests==2.31.0  # For downloading models
 
 # Image processing
 scipy==1.11.2

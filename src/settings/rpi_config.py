@@ -74,7 +74,14 @@ class RPiConfig:
         if self.is_rpi:
             return {
                 'optimize_for_rpi': True,
-                'use_gpu': False,
+                'use_ml_model': True,
+                'model_path': 'src/models/efficientdet_lite2.tflite',
+                'labels_path': 'src/models/coco_labels.txt',
+                'confidence_threshold': 0.5,
+                'max_results': 10,
+                'car_classes': ['car', 'truck', 'bus'],
+                # Fallback to CV if ML fails
+                'use_fallback_cv': True,
                 'background_history': 50,
                 'var_threshold': 30,
                 'min_car_area': 200
@@ -82,7 +89,14 @@ class RPiConfig:
         else:
             return {
                 'optimize_for_rpi': False,
-                'use_gpu': True,
+                'use_ml_model': True,
+                'model_path': 'src/models/efficientdet_lite2.tflite',
+                'labels_path': 'src/models/coco_labels.txt',
+                'confidence_threshold': 0.6,
+                'max_results': 15,
+                'car_classes': ['car', 'truck', 'bus'],
+                # Fallback to CV if ML fails
+                'use_fallback_cv': True,
                 'background_history': 100,
                 'var_threshold': 40,
                 'min_car_area': 500

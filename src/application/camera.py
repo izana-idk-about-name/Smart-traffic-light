@@ -1,6 +1,7 @@
 import cv2
 from typing import Optional
-from src.settings.config import ENVIRONTMENT
+from src.settings.config import ENVIRONMENT
+
 class CameraAccess:
     def access_camera(self, camera_index: int = 0) -> Optional[bool]:
         """
@@ -12,7 +13,6 @@ class CameraAccess:
         Returns:
             True se a câmera foi acessada com sucesso, None se houve erro
         """
-        env = [0 if ENVIRONTMENT == "development" else "Data/images.jpeg"]
         cap = None
         try:
             cap = cv2.VideoCapture(camera_index)
@@ -45,6 +45,3 @@ class CameraAccess:
             cv2.destroyAllWindows()
             
         return True
-    
-app = CameraAccess()
-app.access_camera()

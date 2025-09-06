@@ -1,6 +1,6 @@
-# Sistema de Controle de Semáforos com IA
+# Sistema de Controle de Semáforos com IA 🤖
 
-Sistema inteligente para controle de semáforos baseado em visão computacional, otimizado para Raspberry Pi 4.
+Sistema inteligente para controle de semáforos baseado em **inteligência artificial** e visão computacional, otimizado para Raspberry Pi 4.
 
 ## 🎯 Objetivo
 
@@ -8,12 +8,14 @@ Controlar dois semáforos de forma inteligente, analisando o fluxo de veículos 
 
 ## 📋 Funcionalidades
 
-- **Detecção de veículos** em tempo real usando visão computacional
-- **Decisão inteligente** baseada no número de veículos em cada direção
-- **Otimização para Raspberry Pi 4** com configurações específicas
-- **Comunicação com orquestrador** via TCP/WebSocket
-- **Monitoramento de performance** e estatísticas
-- **Modo de teste** para desenvolvimento
+- 🤖 **Detecção de veículos com IA** usando machine learning (MobileNet SSD)
+- 🎯 **Precisão superior** comparada à visão computacional tradicional
+- ⚡ **Decisão inteligente** baseada no número de veículos em cada direção
+- 🖥️ **Otimização para Raspberry Pi 4** com configurações específicas
+- 🌐 **Comunicação com orquestrador** via TCP/WebSocket
+- 📊 **Monitoramento de performance** e estatísticas em tempo real
+- 🔄 **Modo híbrido** com fallback para visão computacional tradicional
+- 🧪 **Modo de teste** para desenvolvimento
 
 ## 🏗️ Arquitetura
 
@@ -23,20 +25,29 @@ src/
 │   ├── camera.py          # Interface de câmera
 │   └── comunicator.py     # Comunicação com orquestrador
 ├── models/
-│   └── car_identify.py    # Modelo de identificação de carros
+│   ├── car_identify.py    # 🚗 Modelo de IA para identificação de carros
+│   └── download_models.py # 📥 Download de modelos ML pré-treinados
 ├── settings/
-│   ├── config.py          # Configurações gerais
-│   └── rpi_config.py      # Configurações específicas para Raspberry Pi
+│   ├── config.py          # ⚙️ Configurações gerais
+│   └── rpi_config.py      # 🖥️ Configurações específicas para Raspberry Pi
 ├── training/
-│   └── Tcar_identify.py   # Treinamento do modelo
-├── Data/                  # Dados de treinamento
-├── main.py               # Aplicação principal
-└── requirements.txt      # Dependências
+│   └── capture_training_data.py # 🎯 Captura de dados para treinamento
+├── Data/                  # 📊 Dados de treinamento
+├── main.py               # 🎮 Aplicação principal
+└── requirements.txt      # 📦 Dependências
+setup_ai_system.py       # 🔧 Setup automático com IA
 ```
 
 ## 🚀 Instalação
 
-### 1. Preparação do Raspberry Pi
+### 1. Setup Automático com IA (Recomendado) 🚀
+
+```bash
+# Setup completo com download de modelos IA
+python3 setup_ai_system.py
+```
+
+### 2. Preparação do Raspberry Pi Manual
 
 ```bash
 # Atualizar sistema
@@ -47,6 +58,9 @@ sudo apt install python3-pip python3-opencv libatlas-base-dev -y
 
 # Instalar dependências Python
 pip3 install -r requirements.txt
+
+# Download de modelos IA pré-treinados
+python3 src/models/download_models.py
 ```
 
 ### 2. Configuração das Câmeras
@@ -101,6 +115,37 @@ O sistema detecta automaticamente se está rodando em Raspberry Pi e aplica otim
 - **FPS otimizado**: 10 fps
 - **Processamento otimizado**: Menor uso de CPU e memória
 - **Intervalo de decisão**: 3 segundos
+
+## 🤖 Sistema de Inteligência Artificial
+
+### Detecção com IA vs Visão Computacional
+
+| Aspecto | IA (MobileNet SSD) | Visão Computacional (MOG2) |
+|---|---|---|
+| **Precisão** | ⭐⭐⭐⭐⭐ Alta precisão | ⭐⭐⭐ Boa em condições ideais |
+| **Robustez** | ⭐⭐⭐⭐⭐ Funciona bem em condições variadas | ⭐⭐⭐ Sensível a iluminação |
+| **Velocidade** | ⭐⭐⭐⭐ Rápida no RPi | ⭐⭐⭐⭐⭐ Muito rápida |
+| **Tipo** | Machine Learning | Algoritmo estatístico |
+| **Uso** | Detecção precisa de objetos | Motion detection básica |
+
+### Configuração da IA
+
+A IA é habilitada automaticamente se os modelos estiverem disponíveis:
+
+```bash
+# Verificar se IA está funcionando
+python3 -c "
+from src.models.car_identify import create_car_identifier
+identifier = create_car_identifier()
+print('IA ativa:', identifier.model_loaded)
+"
+```
+
+### Modelos Utilizados
+
+- **MobileNet SSD**: Modelo pré-treinado no COCO dataset
+- **TensorFlow**: Framework de ML para inferência
+- **OpenCV DNN**: Interface para execução de modelos
 
 ## 🎮 Uso
 

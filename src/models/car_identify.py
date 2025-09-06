@@ -1,42 +1,54 @@
 import cv2
 import numpy as np
 import time
+import os
+from pathlib import Path
+from typing import Tuple, List, Optional
+from src.settings.rpi_config import MODEL_SETTINGS
 
 class CarIdentifier:
-    def __init__(self, use_gpu=False, optimize_for_rpi=True):
+    def __init__(self, optimize_for_rpi=True, use_ml=True):
         """
-        Initialize car identifier with optimization options
-        
+        Initialize car identifier with AI/ML capabilities
+
         Args:
-            use_gpu: Whether to use GPU acceleration (if available)
             optimize_for_rpi: Whether to optimize for Raspberry Pi performance
+            use_ml: Whether to use ML model for detection
         """
-        self.use_gpu = use_gpu
         self.optimize_for_rpi = optimize_for_rpi
-        
-        # Use background subtractor for simple car detection
-        # Optimized parameters for Raspberry Pi
+        self.use_ml = use_ml and MODEL_SETTINGS.get('use_ml_model', False)
+
+        # Initialize ML model
+        self.ml_model = None
+        self.labels = []
+        self.model_loaded = False
+
+        if self.use_ml:
+            self._load_ml_model()
+
+        # Fallback: traditional CV background subtractor
         if optimize_for_rpi:
-            # Lower history for faster processing on RPi
             self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-                history=50, 
-                varThreshold=30,
-                detectShadows=False  # Disable shadows for better performance
+                history=MODEL_SETTINGS.get('background_history', 50),
+                varThreshold=MODEL_SETTINGS.get('var_threshold', 30),
+                detectShadows=False
             )
         else:
             self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-                history=100, 
-                varThreshold=40,
+                history=MODEL_SETTINGS.get('background_history', 100),
+                varThreshold=MODEL_SETTINGS.get('var_threshold', 40),
                 detectShadows=True
             )
-        
-        # Smaller kernel for morphological operations on RPi
+
+        # Kernel for morphological operations
         kernel_size = 3 if optimize_for_rpi else 5
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        
+
         # Performance tracking
         self.frame_count = 0
         self.total_processing_time = 0
+        self.ml_inference_count = 0
+        self.ml_inference_time = 0
         
     def preprocess_frame(self, frame):
         """Preprocess frame for better detection and performance"""
@@ -51,54 +63,84 @@ class CarIdentifier:
             gray = frame
             
         return gray
-    
-    def count_cars(self, frame):
-        """
-        Counts cars in a given frame using background subtraction and contour detection.
-        Optimized for Raspberry Pi performance.
-        
-        Args:
-            frame: np.ndarray, image from camera
-        Returns:
-            int: estimated number of cars
-        """
-        start_time = time.time()
-        
-        # Preprocess frame
-        processed_frame = self.preprocess_frame(frame)
-        
-        # Apply background subtraction
-        fg_mask = self.bg_subtractor.apply(processed_frame)
-        
-        # Morphological operations to reduce noise
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self.kernel)
-        
-        # Find contours
-        contours, _ = cv2.findContours(
-            fg_mask, 
-            cv2.RETR_EXTERNAL, 
-            cv2.CHAIN_APPROX_SIMPLE
-        )
-        
+
+    def _extract_cars_from_contours(self, contours, processed_frame, original_frame=None):
+        """Extract car count and contour data from contours"""
         car_count = 0
         min_area = 200 if self.optimize_for_rpi else 500
-        
+        valid_contours = []
+
+        # Calculate scale factors if original frame provided and frame was resized
+        scale_x = 1.0
+        scale_y = 1.0
+        if original_frame is not None and self.optimize_for_rpi:
+            scale_x = original_frame.shape[1] / processed_frame.shape[1]
+            scale_y = original_frame.shape[0] / processed_frame.shape[0]
+
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area > min_area:
                 # Additional filtering for better accuracy
                 x, y, w, h = cv2.boundingRect(cnt)
+
+                # Scale back if original frame provided
+                if original_frame is not None and self.optimize_for_rpi:
+                    x = int(x * scale_x)
+                    y = int(y * scale_y)
+                    w = int(w * scale_x)
+                    h = int(h * scale_y)
+
                 aspect_ratio = float(w) / h if h > 0 else 0
-                
+
                 # Filter based on aspect ratio (typical car shape)
                 if 0.5 < aspect_ratio < 3.0:
                     car_count += 1
-        
+                    valid_contours.append((x, y, w, h))
+
+        return car_count, valid_contours
+    
+    def count_cars(self, frame):
+        """
+        Counts cars using AI/ML model with CV fallback.
+        Uses machine learning for accurate car detection when available.
+
+        Args:
+            frame: np.ndarray, image from camera
+        Returns:
+            int: number of cars detected
+        """
+        debug_mode = os.getenv('MODO', '').lower() == 'development'
+
+        if frame is None or frame.size == 0:
+            if debug_mode:
+                print("Debug: Invalid frame provided to count_cars")
+            return 0
+
+        if debug_mode:
+            print("Debug: 🔄 Starting car counting process...")
+
+        start_time = time.time()
+
+        # Use new ML-based detection
+        car_boxes = self.detect_cars(frame)
+        car_count = len(car_boxes)
+
+        processing_time = time.time() - start_time
+
+        if debug_mode:
+            print(f"Debug: ⏱️  Processing time: {processing_time:.3f}s")
+            if car_count > 0:
+                print(f"Debug: 🚗 Car detection successful: {car_count} cars found")
+                for i, detection in enumerate(car_boxes):
+                    print(f"Debug:   Car {i+1}: {detection.get('class', 'unknown')} "
+                          f"(confidence: {detection.get('confidence', 0):.2f})")
+            else:
+                print(f"Debug: 🚫 No cars detected in this frame")
+
         # Update performance metrics
         self.frame_count += 1
-        processing_time = time.time() - start_time
         self.total_processing_time += processing_time
-        
+
         return car_count
     
     def get_average_processing_time(self):
@@ -114,66 +156,194 @@ class CarIdentifier:
     
     def visualize_detection(self, frame, show_contours=False):
         """
-        Create visualization of car detection (for debugging)
-        
+        Create visualization of car detection using AI/ML (for debugging)
+
         Args:
             frame: Input frame
-            show_contours: Whether to draw contours
-            
+            show_contours: Whether to draw bounding boxes
+
         Returns:
             tuple: (count, visualization_frame)
         """
+        if frame is None or frame.size == 0:
+            if os.getenv('MODO', '').lower() == 'development':
+                print("Debug: Invalid frame provided to visualize_detection")
+            return 0, frame
+
+        # Create visualization frame
+        vis_frame = frame.copy()
+
+        # Use ML-based detection
+        car_boxes = self.detect_cars(frame)
+        car_count = len(car_boxes)
+
+        # Draw detections
+        for i, detection in enumerate(car_boxes):
+            if show_contours:
+                x, y, w, h = detection['bbox']
+                confidence = detection['confidence']
+                class_name = detection['class']
+
+                # Color based on detection method
+                color = (0, 255, 0) if 'cv' not in class_name.lower() else (255, 0, 0)  # Green for ML, Red for CV
+
+                cv2.rectangle(vis_frame, (x, y), (x + w, y + h), color, 2)
+
+                # Label with class and confidence
+                label = "02d"
+                cv2.putText(vis_frame, label, (x, y - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        # Add performance info
+        avg_time = self.get_average_processing_time()
+        method = "ML" if self.model_loaded else "CV"
+        cv2.putText(vis_frame, f'{method} Cars: {car_count}', (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(vis_frame, f'Avg Time: {avg_time:.3f}s', (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        # Add ML-specific info if available
+        if self.ml_inference_count > 0:
+            ml_avg_time = self.ml_inference_time / self.ml_inference_count
+            cv2.putText(vis_frame, f'ML Time: {ml_avg_time:.3f}s', (10, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+        return car_count, vis_frame
+
+    def _load_ml_model(self):
+        """Load ML model for car detection (silent by default)"""
+        # Get debug mode from environment
+        debug_mode = os.getenv('MODO', '').lower() == 'development'
+
+        try:
+            model_path = Path(MODEL_SETTINGS.get('model_path', 'src/models/ssd_mobilenet_v3_large_coco.pb'))
+            config_path = Path(MODEL_SETTINGS.get('model_path', 'src/models/ssd_mobilenet_v3_large_coco.pbtxt').replace('.pb', '.pbtxt'))
+            labels_path = Path(MODEL_SETTINGS.get('labels_path', 'src/models/coco_labels.txt'))
+
+            # Check if model files exist
+            if not model_path.exists() or not config_path.exists():
+                if debug_mode:
+                    print(f"Debug: ML model files not found. Using fallback CV method.")
+                self.model_loaded = False
+                return
+
+            # Load OpenCV DNN model
+            self.ml_model = cv2.dnn_DetectionModel(str(model_path), str(config_path))
+            self.ml_model.setInputSize(320, 320)
+            self.ml_model.setInputScale(1.0/127.5)
+            self.ml_model.setInputMean((127.5, 127.5, 127.5))
+            self.ml_model.setInputSwapRB(True)
+
+            # Load labels
+            if labels_path.exists():
+                with open(labels_path, 'r') as f:
+                    self.labels = [line.strip().split(': ')[-1] for line in f.readlines()]
+
+            self.model_loaded = True
+            if debug_mode:
+                print("Debug: ML model loaded successfully for car detection")
+                print(f"Debug: Available classes: {len(self.labels)}")
+
+        except Exception as e:
+            if debug_mode:
+                print(f"Debug: Error loading ML model: {e}. Using fallback CV method.")
+            self.model_loaded = False
+
+    def _detect_with_ml(self, frame):
+        """Detect cars using ML model"""
+        if not self.model_loaded or self.ml_model is None:
+            return []
+
+        try:
+            start_time = time.time()
+
+            # Prepare image for model
+            height, width = frame.shape[:2]
+
+            # Detect objects
+            classes, confidences, boxes = self.ml_model.detect(frame, confThreshold=MODEL_SETTINGS.get('confidence_threshold', 0.5))
+
+            detection_time = time.time() - start_time
+            self.ml_inference_count += 1
+            self.ml_inference_time += detection_time
+
+            # Filter for car-related classes
+            car_classes = MODEL_SETTINGS.get('car_classes', ['car', 'truck', 'bus'])
+            car_boxes = []
+
+            if len(classes) > 0:
+                for i, class_id in enumerate(classes.flatten()):
+                    if class_id < len(self.labels):
+                        class_name = self.labels[class_id]
+                        if class_name.lower() in [c.lower() for c in car_classes]:
+                            box = boxes[i]
+                            car_boxes.append({
+                                'bbox': box,
+                                'confidence': confidences[i],
+                                'class': class_name
+                            })
+
+            return car_boxes
+
+        except Exception as e:
+            if os.getenv('MODO', '').lower() == 'development':
+                print(f"Debug: ML inference error: {e}")
+            return []
+
+    def _detect_with_cv(self, frame):
+        """Fallback: Detect cars using traditional CV"""
         processed_frame = self.preprocess_frame(frame)
         fg_mask = self.bg_subtractor.apply(processed_frame)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self.kernel)
-        
+
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        car_count = 0
-        min_area = 200 if self.optimize_for_rpi else 500
-        
-        # Create visualization frame
-        vis_frame = frame.copy()
-        
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area > min_area:
-                x, y, w, h = cv2.boundingRect(cnt)
-                aspect_ratio = float(w) / h if h > 0 else 0
-                
-                if 0.5 < aspect_ratio < 3.0:
-                    car_count += 1
-                    
-                    if show_contours:
-                        cv2.rectangle(vis_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        cv2.putText(vis_frame, f'Car {car_count}', (x, y - 10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        
-        # Add performance info
-        avg_time = self.get_average_processing_time()
-        cv2.putText(vis_frame, f'Cars: {car_count}', (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        cv2.putText(vis_frame, f'Avg Time: {avg_time:.3f}s', (10, 60), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-        
-        return car_count, vis_frame
+
+        car_count, valid_contours = self._extract_cars_from_contours(contours, processed_frame, original_frame=frame)
+
+        # Convert to same format as ML detection for consistency
+        cv_boxes = []
+        for contour in valid_contours:
+            x, y, w, h = contour
+            cv_boxes.append({
+                'bbox': [x, y, w, h],
+                'confidence': 0.8,  # Default confidence for CV method
+                'class': 'car_cv'
+            })
+
+        return cv_boxes
+
+    def detect_cars(self, frame):
+        """Main detection method - uses ML if available, CV as fallback"""
+        car_boxes = []
+
+        if self.use_ml and self.model_loaded:
+            car_boxes = self._detect_with_ml(frame)
+            if not car_boxes and MODEL_SETTINGS.get('use_fallback_cv', True):
+                print("ML detection failed, using CV fallback")
+                car_boxes = self._detect_with_cv(frame)
+        else:
+            car_boxes = self._detect_with_cv(frame)
+
+        return car_boxes
 
 # Factory function for creating optimized car identifier
-def create_car_identifier(mode='rpi'):
+def create_car_identifier(mode='rpi', use_ml=True):
     """
     Factory function to create car identifier based on target platform
-    
+    Now includes AI/ML capabilities.
+
     Args:
         mode: 'rpi' for Raspberry Pi, 'desktop' for desktop, 'debug' for debugging
-        
+        use_ml: Whether to use ML model for car detection
+
     Returns:
-        CarIdentifier instance
+        CarIdentifier instance with AI capabilities
     """
     if mode == 'rpi':
-        return CarIdentifier(optimize_for_rpi=True, use_gpu=False)
+        return CarIdentifier(optimize_for_rpi=True, use_ml=use_ml)
     elif mode == 'desktop':
-        return CarIdentifier(optimize_for_rpi=False, use_gpu=True)
+        return CarIdentifier(optimize_for_rpi=False, use_ml=use_ml)
     elif mode == 'debug':
-        return CarIdentifier(optimize_for_rpi=False, use_gpu=False)
+        return CarIdentifier(optimize_for_rpi=False, use_ml=use_ml)
     else:
-        return CarIdentifier(optimize_for_rpi=True, use_gpu=False)
+        return CarIdentifier(optimize_for_rpi=True, use_ml=use_ml)
