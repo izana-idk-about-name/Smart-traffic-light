@@ -5,25 +5,35 @@ import os
 from pathlib import Path
 from typing import Tuple, List, Optional
 from src.settings.rpi_config import MODEL_SETTINGS
+from src.training.custom_car_trainer import LightweightCarTrainer
 
 class CarIdentifier:
-    def __init__(self, optimize_for_rpi=True, use_ml=True):
+    def __init__(self, optimize_for_rpi=True, use_ml=True, use_custom_model=False):
         """
         Initialize car identifier with AI/ML capabilities
 
         Args:
             optimize_for_rpi: Whether to optimize for Raspberry Pi performance
             use_ml: Whether to use ML model for detection
+            use_custom_model: Whether to use custom trained SVM model instead of pre-trained
         """
         self.optimize_for_rpi = optimize_for_rpi
         self.use_ml = use_ml and MODEL_SETTINGS.get('use_ml_model', False)
+        self.use_custom_model = use_custom_model
 
         # Initialize ML model
         self.ml_model = None
         self.labels = []
         self.model_loaded = False
 
-        if self.use_ml:
+        # Initialize custom SVM model
+        self.custom_trainer = None
+        self.custom_model_loaded = False
+
+        if self.use_custom_model:
+            self._load_custom_model()
+            # Don't load ML model when using custom model - custom handles everything
+        elif self.use_ml:
             self._load_ml_model()
 
         # Fallback: traditional CV background subtractor
@@ -210,6 +220,28 @@ class CarIdentifier:
 
         return car_count, vis_frame
 
+    def _load_custom_model(self):
+        """Load custom trained SVM model for car detection"""
+        debug_mode = os.getenv('MODO', '').lower() == 'development'
+
+        try:
+            self.custom_trainer = LightweightCarTrainer()
+            model_path = 'src/models/custom_car_detector.yml'
+
+            if self.custom_trainer.load_model(model_path):
+                self.custom_model_loaded = True
+                if debug_mode:
+                    print("Debug: Custom SVM model loaded successfully for car detection")
+            else:
+                if debug_mode:
+                    print("Debug: Custom model not found. Using fallback CV method.")
+                self.custom_model_loaded = False
+
+        except Exception as e:
+            if debug_mode:
+                print(f"Debug: Error loading custom model: {e}. Using fallback CV method.")
+            self.custom_model_loaded = False
+
     def _load_ml_model(self):
         """Load ML model for car detection (silent by default)"""
         # Get debug mode from environment
@@ -248,6 +280,59 @@ class CarIdentifier:
             if debug_mode:
                 print(f"Debug: Error loading ML model: {e}. Using fallback CV method.")
             self.model_loaded = False
+
+    def _detect_with_custom_model(self, frame):
+        """Detect cars using custom trained SVM model with fail-safe behavior"""
+        if not self.custom_model_loaded or self.custom_trainer is None:
+            return []
+
+        try:
+            start_time = time.time()
+
+            # Save frame temporarily for SVM prediction
+            temp_path = f"/tmp/frame_{int(time.time()*1000)}.jpg"
+            success = cv2.imwrite(temp_path, frame)
+
+            if not success:
+                # Fail-safe: return no detection instead of error
+                return []
+
+            # Use SVM to predict
+            prediction, confidence = self.custom_trainer.predict(temp_path)
+
+            detection_time = time.time() - start_time
+            self.ml_inference_count += 1
+            self.ml_inference_time += detection_time
+
+            # Clean up temp file
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+
+            # Check for error in prediction - return no detection for safety
+            if prediction == -1:
+                return []
+
+            # Only return detection if we're very confident (car detected with high confidence)
+            if prediction == 1 and confidence > 0.8:  # Higher threshold for safety
+                # For custom model, we don't have bounding boxes, so create a full-frame detection
+                height, width = frame.shape[:2]
+                car_boxes = [{
+                    'bbox': [0, 0, width, height],  # Full frame
+                    'confidence': confidence,
+                    'class': 'car_custom'
+                }]
+                return car_boxes
+
+            # For uncertain cases or no cars detected, return empty list (no false positives)
+            return []
+
+        except Exception as e:
+            # Fail-safe: return no detection instead of error
+            if os.getenv('MODO', '').lower() == 'development':
+                print(f"Debug: Custom model inference error: {e}")
+            return []
 
     def _detect_with_ml(self, frame):
         """Detect cars using ML model"""
@@ -290,6 +375,47 @@ class CarIdentifier:
                 print(f"Debug: ML inference error: {e}")
             return []
 
+    def _detect_with_cv_conservative(self, frame):
+        """Conservative CV detection with balanced thresholds for reliable detection"""
+        processed_frame = self.preprocess_frame(frame)
+        fg_mask = self.bg_subtractor.apply(processed_frame)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self.kernel)
+
+        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Balanced area threshold for reliable detection
+        min_area = 400 if self.optimize_for_rpi else 800  # Adjusted for better detection
+        valid_contours = []
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > min_area:
+                # Filtering for car-like shapes
+                x, y, w, h = cv2.boundingRect(cnt)
+                aspect_ratio = float(w) / h if h > 0 else 0
+
+                # Reasonable aspect ratio for cars
+                if 0.4 < aspect_ratio < 3.5 and w > 30 and h > 20:  # Adjusted size requirements
+                    # Solidity check to avoid fragmented detections
+                    hull = cv2.convexHull(cnt)
+                    hull_area = cv2.contourArea(hull)
+                    solidity = float(area) / hull_area if hull_area > 0 else 0
+
+                    if solidity > 0.6:  # Reasonable solidity threshold
+                        valid_contours.append((x, y, w, h))
+
+        # Convert to same format as ML detection
+        cv_boxes = []
+        for contour in valid_contours:
+            x, y, w, h = contour
+            cv_boxes.append({
+                'bbox': [x, y, w, h],
+                'confidence': 0.7,  # Moderate confidence for balanced method
+                'class': 'car_cv_conservative'
+            })
+
+        return cv_boxes
+
     def _detect_with_cv(self, frame):
         """Fallback: Detect cars using traditional CV"""
         processed_frame = self.preprocess_frame(frame)
@@ -313,37 +439,38 @@ class CarIdentifier:
         return cv_boxes
 
     def detect_cars(self, frame):
-        """Main detection method - uses ML if available, CV as fallback"""
+        """Main detection method using conservative CV for reliable counting"""
         car_boxes = []
 
-        if self.use_ml and self.model_loaded:
-            car_boxes = self._detect_with_ml(frame)
-            if not car_boxes and MODEL_SETTINGS.get('use_fallback_cv', True):
-                print("ML detection failed, using CV fallback")
-                car_boxes = self._detect_with_cv(frame)
-        else:
-            car_boxes = self._detect_with_cv(frame)
+        # Use conservative CV detection for reliable multi-car counting
+        # Custom model is only for presence detection, not suitable for counting
+        car_boxes = self._detect_with_cv_conservative(frame)
+
+        # Debug: print detection results
+        if os.getenv('MODO', '').lower() == 'development':
+            print(f"Debug: Detected {len(car_boxes)} cars in frame")
 
         return car_boxes
 
 # Factory function for creating optimized car identifier
-def create_car_identifier(mode='rpi', use_ml=True):
+def create_car_identifier(mode='rpi', use_ml=True, use_custom_model=False):
     """
     Factory function to create car identifier based on target platform
-    Now includes AI/ML capabilities.
+    Now includes AI/ML capabilities and custom model support.
 
     Args:
         mode: 'rpi' for Raspberry Pi, 'desktop' for desktop, 'debug' for debugging
         use_ml: Whether to use ML model for car detection
+        use_custom_model: Whether to use custom trained model (recommended for RPi)
 
     Returns:
         CarIdentifier instance with AI capabilities
     """
     if mode == 'rpi':
-        return CarIdentifier(optimize_for_rpi=True, use_ml=use_ml)
+        return CarIdentifier(optimize_for_rpi=True, use_ml=use_ml, use_custom_model=use_custom_model)
     elif mode == 'desktop':
-        return CarIdentifier(optimize_for_rpi=False, use_ml=use_ml)
+        return CarIdentifier(optimize_for_rpi=False, use_ml=use_ml, use_custom_model=use_custom_model)
     elif mode == 'debug':
-        return CarIdentifier(optimize_for_rpi=False, use_ml=use_ml)
+        return CarIdentifier(optimize_for_rpi=False, use_ml=use_ml, use_custom_model=use_custom_model)
     else:
-        return CarIdentifier(optimize_for_rpi=True, use_ml=use_ml)
+        return CarIdentifier(optimize_for_rpi=True, use_ml=use_ml, use_custom_model=use_custom_model)

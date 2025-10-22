@@ -38,6 +38,81 @@ src/
 setup_ai_system.py       # 🔧 Setup automático com IA
 ```
 
+## 🔄 Fluxograma do Sistema
+
+```mermaid
+flowchart TD
+
+    %% --- INICIALIZAÇÃO ---
+    A([Inicialização do Sistema]) --> B[Configurar Câmeras A e B]
+    B --> C[[Loop Principal]]
+
+    %% --- CAPTURA DE FRAMES ---
+    C --> D[Capturar Frame da Câmera A]
+    C --> E[Capturar Frame da Câmera B]
+    D --> F[Detectar Carros com IA e ML]
+    E --> F
+
+    %% --- CONTAGEM ---
+    F --> G[Contar Carros de A - count_a]
+    F --> H[Contar Carros de B - count_b]
+    G --> I{Executar Lógica de Decisão}
+    H --> I
+
+    %% --- CONDIÇÕES ---
+    I --> J{count_a maior que count_b?}
+    I --> K{count_b maior que count_a?}
+    I --> L{count_a igual a count_b?}
+
+    %% --- DECISÕES ---
+    J --> M[Decisão: Abrir Semáforo A]
+    K --> N[Decisão: Abrir Semáforo B]
+    L --> O[Alternar para evitar fome]
+
+    %% --- ORQUESTRADOR ---
+    M --> P[Enviar decisão ao Orquestrador]
+    N --> P
+    O --> P
+
+    %% --- WEBSOCKET ---
+    P --> Q[Mensagem WebSocket - Decisão]
+    P --> R[Mensagem WebSocket - Status]
+    Q --> S[Objeto JSON de decisão]
+    R --> T[Objeto JSON de status]
+
+    %% --- RESPOSTA DO ORQUESTRADOR ---
+    S --> U[Orquestrador recebe decisão]
+    T --> U
+    U --> V[Aguardar próximo ciclo]
+    V --> C
+
+    %% --- ERRO / ENCERRAMENTO ---
+    C -->|Erro ou interrupção| W[Interrupção ou erro detectado]
+    W --> X([Encerrar Sistema])
+
+```
+
+**Valores enviados ao Orquestrador via WebSocket:**
+
+- **Decisão de Semáforo:**
+  ```json
+  {
+    "type": "decision",
+    "direction": "A" | "B",
+    "timestamp": 1234567890.123
+  }
+  ```
+
+- **Status de Tráfego:**
+  ```json
+  {
+    "type": "status",
+    "count_a": 5,
+    "count_b": 3,
+    "timestamp": 1234567890.123
+  }
+  ```
+
 ## 🚀 Instalação
 
 ### 1. Setup Automático com IA (Recomendado) 🚀

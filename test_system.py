@@ -26,26 +26,28 @@ class SystemTester:
         self.tests_passed = 0
         self.tests_total = 0
         
-    def test(self, test_name):
+    def test(self, func=None):
         """Decorator para executar testes"""
-        def decorator(func):
-            def wrapper(*args, **kwargs):
-                self.tests_total += 1
-                try:
-                    logger.info(f"🧪 Executando teste: {test_name}")
-                    result = func(*args, **kwargs)
-                    if result is not False:
-                        logger.info(f"✅ {test_name} - PASSOU")
-                        self.tests_passed += 1
-                        return True
-                    else:
-                        logger.error(f"❌ {test_name} - FALHOU")
-                        return False
-                except Exception as e:
-                    logger.error(f"❌ {test_name} - ERRO: {e}")
+        if func is None:
+            return lambda f: self.test(f)
+
+        def wrapper(*args, **kwargs):
+            self.tests_total += 1
+            test_name = func.__name__.replace('_', ' ').title()
+            try:
+                logger.info(f"🧪 Executando teste: {test_name}")
+                result = func(*args, **kwargs)
+                if result is not False:
+                    logger.info(f"✅ {test_name} - PASSOU")
+                    self.tests_passed += 1
+                    return True
+                else:
+                    logger.error(f"❌ {test_name} - FALHOU")
                     return False
-            return wrapper
-        return decorator
+            except Exception as e:
+                logger.error(f"❌ {test_name} - ERRO: {e}")
+                return False
+        return wrapper
     
     def run_all_tests(self):
         """Executar todos os testes"""
@@ -73,7 +75,7 @@ class SystemTester:
             logger.warning("⚠️  Alguns testes falharam. Verifique os logs acima.")
             return False
     
-    @test("Dependências Python")
+    @test
     def test_dependencies(self):
         """Verificar se todas as dependências estão instaladas"""
         required_packages = [
@@ -95,7 +97,7 @@ class SystemTester:
         
         return True
     
-    @test("Acesso às Câmeras")
+    @test
     def test_camera_access(self):
         """Verificar se as câmeras estão acessíveis"""
         cameras_found = 0
@@ -121,7 +123,7 @@ class SystemTester:
             logger.error(f"  ❌ Apenas {cameras_found} câmeras encontradas (mínimo 2)")
             return False
     
-    @test("Carregamento do Modelo")
+    @test
     def test_model_loading(self):
         """Verificar se o modelo de identificação carrega corretamente"""
         try:
@@ -140,7 +142,7 @@ class SystemTester:
             logger.error(f"  ❌ Erro ao carregar modelo: {e}")
             return False
     
-    @test("Configuração do Sistema")
+    @test
     def test_configuration(self):
         """Verificar configurações do sistema"""
         try:
@@ -158,7 +160,7 @@ class SystemTester:
             logger.error(f"  ❌ Erro na configuração: {e}")
             return False
     
-    @test("Estrutura de Arquivos")
+    @test
     def test_file_structure(self):
         """Verificar se todos os arquivos necessários existem"""
         required_files = [
