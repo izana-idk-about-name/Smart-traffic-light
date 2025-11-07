@@ -68,7 +68,6 @@ class OrchestratorComunicator:
     def _send_message(self, message: Dict[str, Any]) -> bool:
         """Send message to orchestrator"""
         if not self.connected or not self.socket:
-            print("Not connected to orchestrator")
             return False
 
         try:
@@ -83,11 +82,9 @@ class OrchestratorComunicator:
             # Send message data
             self.socket.send(data)
 
-            print(f"Message sent: {message}")
             return True
 
         except Exception as e:
-            print(f"Failed to send message: {e}")
             self.connected = False
             return False
 

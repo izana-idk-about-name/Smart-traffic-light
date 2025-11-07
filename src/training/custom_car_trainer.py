@@ -14,6 +14,7 @@ from sklearn.metrics import classification_report
 import pickle
 import time
 from typing import List, Tuple
+from src.training.data_validator import TrainingDataValidator, validate_dataset_quick
 
 class LightweightCarTrainer:
     def __init__(self, data_dir='data'):
@@ -30,8 +31,9 @@ class LightweightCarTrainer:
         self.svm = cv2.ml.SVM_create()
         self.svm.setType(cv2.ml.SVM_C_SVC)
         self.svm.setKernel(cv2.ml.SVM_RBF)
-        self.svm.setC(1.0)
-        self.svm.setGamma(0.1)
+        self.svm.setC(10.0)  # Aumenta a penalidade para erros
+        self.svm.setGamma(0.01)  # Menor gamma para maior generalização
+        self.svm.setTermCriteria((cv2.TERM_CRITERIA_MAX_ITER, 10000, 1e-6))
 
     def extract_hog_features(self, image_path: str) -> np.ndarray:
         """Extract HOG features from image with robust preprocessing for real KITTI data"""
@@ -100,24 +102,25 @@ class LightweightCarTrainer:
             return None
 
     def load_training_data(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Load and prepare training data"""
+        """Load and prepare training data with proper positive/negative balance"""
         features = []
         labels = []
 
         # Load car images (positive samples)
+        car_files = []
         carro_dir = self.data_dir / 'kitti' / 'images_real' / 'toy_car'
         if carro_dir.exists():
             # Recursively find all image files in the carro directory and subdirectories
-            car_files = []
-            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp']:
+            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp', '*.avif']:
                 car_files.extend(list(carro_dir.rglob(ext)))
 
         # Load toy_f1 images (positive samples)
         toy_f1_dir = self.data_dir / 'kitti' / 'images_real' / 'toy_f1'
         if toy_f1_dir.exists():
-            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp']:
+            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp', '*.avif']:
                 car_files.extend(list(toy_f1_dir.rglob(ext)))
 
+        if car_files:
             # For KITTI data, use more samples since they're high quality
             if any('kitti' in str(f).lower() or str(f).endswith('.png') for f in car_files[:10]):
                 max_images = len(car_files)  # Use all KITTI images
@@ -127,7 +130,7 @@ class LightweightCarTrainer:
                 max_images = len(car_files) // 4
 
             car_files_subset = random.sample(car_files, min(max_images, len(car_files)))
-            print(f"📸 Loading {len(car_files_subset)} car images from 'carro' directory...")
+            print(f"📸 Loading {len(car_files_subset)} car images (POSITIVE samples)...")
             valid_car_count = 0
             for i, img_path in enumerate(car_files_subset):
                 feat = self.extract_hog_features(str(img_path))
@@ -141,35 +144,91 @@ class LightweightCarTrainer:
                 # Print progress every 500 images
                 if (i + 1) % 500 == 0:
                     progress = (i + 1) / len(car_files_subset) * 100
-                    print(".1f")
+                    print(f"   Progress: {progress:.1f}%")
             print(f"✅ Valid car images loaded: {valid_car_count}")
 
-        # Load background images (negative samples)
-        bg_dir = self.data_dir / 'imagens_originais'
-        if bg_dir.exists():
-            bg_files = list(bg_dir.glob('*.jpg')) + list(bg_dir.glob('*.png')) + \
-                        list(bg_dir.glob('*.jpeg')) + list(bg_dir.glob('*.webp'))
-
-            print(f"📸 Loading {len(bg_files)} background images...")
-            for i, img_path in enumerate(bg_files):
+        # Load NEGATIVE samples (images WITHOUT cars) from data/negativo/
+        negativo_dir = self.data_dir / 'negativo'
+        negative_files = []
+        
+        if negativo_dir.exists():
+            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp', '*.avif']:
+                negative_files.extend(list(negativo_dir.glob(ext)))
+            
+            print(f"📸 Loading {len(negative_files)} NEGATIVE samples from data/negativo/...")
+            valid_negative_count = 0
+            for i, img_path in enumerate(negative_files):
                 feat = self.extract_hog_features(str(img_path))
                 if feat is not None:
                     features.append(feat)
-                    labels.append(0)  # Background = 0
+                    labels.append(0)  # No car = 0
+                    valid_negative_count += 1
+                else:
+                    print(f"⚠️  Skipping invalid negative image: {img_path}")
+                
+                # Print progress every 10 images
+                if (i + 1) % 10 == 0:
+                    progress = (i + 1) / len(negative_files) * 100
+                    print(f"   Progress: {progress:.1f}%")
+            print(f"✅ Valid negative images loaded: {valid_negative_count}")
+        
+        # Load NEGATIVE samples from camera captures (data/negativo_camera/)
+        negativo_camera_dir = self.data_dir / 'negativo_camera'
+        if negativo_camera_dir.exists():
+            camera_negative_files = []
+            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp', '*.avif']:
+                camera_negative_files.extend(list(negativo_camera_dir.glob(ext)))
+            
+            if camera_negative_files:
+                print(f"📸 Loading {len(camera_negative_files)} NEGATIVE samples from camera...")
+                for i, img_path in enumerate(camera_negative_files):
+                    feat = self.extract_hog_features(str(img_path))
+                    if feat is not None:
+                        features.append(feat)
+                        labels.append(0)  # No car = 0
+                        valid_negative_count += 1
+                    
+                    # Print progress every 10 images
+                    if (i + 1) % 10 == 0:
+                        progress = (i + 1) / len(camera_negative_files) * 100
+                        print(f"   Progress: {progress:.1f}%")
+                print(f"✅ Camera negative images loaded: {len(camera_negative_files)}")
 
-                # Print progress every 100 images
-                if (i + 1) % 100 == 0:
-                    progress = (i + 1) / len(bg_files) * 100
-                    print(".1f")
+        # Also load background images from imagens_originais (if they exist)
+        bg_dir = self.data_dir / 'imagens_originais'
+        if bg_dir.exists():
+            bg_files = []
+            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp', '*.avif']:
+                bg_files.extend(list(bg_dir.glob(ext)))
+
+            if bg_files:
+                print(f"📸 Loading {len(bg_files)} additional background images...")
+                for i, img_path in enumerate(bg_files):
+                    feat = self.extract_hog_features(str(img_path))
+                    if feat is not None:
+                        features.append(feat)
+                        labels.append(0)  # Background = 0
+
+                    # Print progress every 100 images
+                    if (i + 1) % 100 == 0:
+                        progress = (i + 1) / len(bg_files) * 100
+                        print(f"   Progress: {progress:.1f}%")
 
         if len(features) == 0:
             raise ValueError("❌ No training images found!")
 
+        # Show class distribution
+        unique, counts = np.unique(labels, return_counts=True)
+        print(f"\n📊 Class Distribution:")
+        for cls, count in zip(unique, counts):
+            class_name = "CARS (positive)" if cls == 1 else "NO CARS (negative)"
+            print(f"   {class_name}: {count} samples")
+        
         return np.array(features), np.array(labels)
 
     def augment_data(self, features: np.ndarray, labels: np.ndarray,
-                    augmentation_factor: int = 2) -> Tuple[np.ndarray, np.ndarray]:
-        """Simple data augmentation by adding noise"""
+                    augmentation_factor: int = 4) -> Tuple[np.ndarray, np.ndarray]:
+        """Data augmentation: noise, flip, scale"""
         augmented_features = []
         augmented_labels = []
 
@@ -180,16 +239,73 @@ class LightweightCarTrainer:
 
             # Add noise variations
             for _ in range(augmentation_factor - 1):
-                noise = np.random.normal(0, 0.1, feat.shape)
+                noise = np.random.normal(0, 0.08, feat.shape)
                 noisy_feat = feat + noise
                 augmented_features.append(noisy_feat)
                 augmented_labels.append(label)
 
+            # Flip (simulado via reversão dos vetores HOG)
+            flipped_feat = feat[::-1]
+            augmented_features.append(flipped_feat)
+            augmented_labels.append(label)
+
+            # Scale (simulado via multiplicação)
+            scaled_feat = feat * np.random.uniform(0.9, 1.1, feat.shape)
+            augmented_features.append(scaled_feat)
+            augmented_labels.append(label)
+
         return np.array(augmented_features), np.array(augmented_labels)
 
-    def train_model(self, test_size: float = 0.3):
-        """Train the SVM model"""
+    def train_model(self, test_size: float = 0.3, validate_data: bool = True):
+        """Train the SVM model with optional data validation"""
         print("🚗 Starting lightweight car detection training...")
+
+        # Validate training data if requested
+        if validate_data:
+            print("\n🔍 Validating training data before training...")
+            try:
+                validator = TrainingDataValidator(
+                    min_samples_per_class=50,  # Reasonable minimum for SVM
+                    min_image_width=32,
+                    min_image_height=32,
+                    max_class_imbalance=10.0,
+                    check_duplicates=True
+                )
+                
+                # Validate car data
+                car_dir = self.data_dir / 'kitti' / 'images_real'
+                if car_dir.exists():
+                    result = validator.validate_dataset(str(car_dir), class_dirs=['toy_car', 'toy_f1'])
+                    
+                    print(f"\n{'='*60}")
+                    print("Validação dos Dados de Treinamento")
+                    print(f"{'='*60}")
+                    print(f"Total: {result.total_samples} | Válidos: {result.valid_samples}")
+                    print(f"Status: {'✅ VÁLIDO' if result.is_valid else '⚠️  COM AVISOS'}")
+                    
+                    if result.warnings:
+                        print("\n⚠️  Avisos:")
+                        for warning in result.warnings[:3]:
+                            print(f"  - {warning}")
+                    
+                    if result.errors:
+                        print("\n❌ Erros Críticos:")
+                        for error in result.errors:
+                            print(f"  - {error}")
+                        print("\n🛑 Treinamento cancelado devido a erros nos dados")
+                        print("💡 Corrija os erros e tente novamente")
+                        return None, None
+                    
+                    if result.valid_samples < 50:
+                        print(f"\n⚠️  Apenas {result.valid_samples} amostras válidas encontradas")
+                        print("   Recomendado: pelo menos 100 amostras para treinamento robusto")
+                        print("   Continuando, mas resultados podem ser limitados...")
+                    
+                    print(f"{'='*60}\n")
+                
+            except Exception as e:
+                print(f"⚠️  Erro na validação: {e}")
+                print("   Continuando com treinamento (sem validação)...")
 
         # Load data
         features, labels = self.load_training_data()
@@ -256,8 +372,8 @@ class LightweightCarTrainer:
             _, result = self.svm.predict(features.reshape(1, -1))
             confidence = float(result[0][0])
 
-            # Use higher threshold for better accuracy
-            return int(confidence > 0.7), confidence
+            # Use lower threshold for recall, but return confidence for post-processing
+            return int(confidence > 0.5), confidence
 
         except Exception as e:
             # Return error indicator instead of crashing
@@ -298,19 +414,64 @@ def main():
         print("⚠️  Limited background samples. Creating synthetic ones...")
         create_synthetic_background_samples()
 
-    # Train model
+    # Train model with validation
     try:
-        accuracy, training_time = trainer.train_model()
+        result = trainer.train_model(validate_data=True)
+        if result is None or result[0] is None:
+            print("\n❌ Training aborted due to data validation errors")
+            print("💡 Fix the data issues and try again")
+            return
+        
+        accuracy, training_time = result
         print("\n✅ Training completed successfully!")
-        print(".2f")
+        print(f"📊 Final Accuracy: {accuracy*100:.2f}%")
+        print(f"⏱️  Training Time: {training_time:.2f}s")
         print("💡 This model is optimized for Raspberry Pi performance!")
         print("🔄 You can now use it in your car detection system!")
-
     except Exception as e:
         print(f"❌ Training failed: {e}")
-        return 1
+        import traceback
+        traceback.print_exc()
 
-    return 0
+def demo_camera_detection():
+    """Demonstração ao vivo da detecção de carros usando a IA customizada"""
+    import cv2
+    trainer = LightweightCarTrainer()
+    if not trainer.load_model():
+        print("❌ Modelo não encontrado. Treine antes de rodar a demo.")
+        return
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Não foi possível abrir a câmera.")
+        return
+    print("🔴 Pressione ESC para sair.")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("❌ Falha ao capturar frame da câmera.")
+            break
+        # Salva frame temporário para predição
+        temp_path = "/tmp/frame_demo.jpg"
+        cv2.imwrite(temp_path, frame)
+        pred, conf = trainer.predict(temp_path)
+        label = f"Carro: {'Sim' if pred == 1 else 'Não'} ({conf:.2f})"
+        color = (0, 255, 0) if pred == 1 else (0, 0, 255)
+        cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        # cv2.imshow("Detecção de Carro (IA Customizada)", frame)
+        # Se não houver suporte a GUI, salve o frame com resultado
+        out_path = "/tmp/frame_demo_result.jpg"
+        cv2.imwrite(out_path, frame)
+        print(f"Frame salvo em {out_path} | {label}")
+        # Sem waitKey, apenas salva frames continuamente
+    cap.release()
+    # cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "demo":
+        demo_camera_detection()
+    else:
+        main()
 
 if __name__ == "__main__":
     exit(main())
