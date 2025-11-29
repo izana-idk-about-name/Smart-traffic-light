@@ -3,8 +3,8 @@ import os
 import time
 import threading
 import signal
-import sys
 import atexit
+import gc
 import numpy as np
 from typing import Optional
 from dotenv import load_dotenv
@@ -15,22 +15,25 @@ from src.settings.rpi_config import CAMERA_SETTINGS, PROCESSING_SETTINGS, MODEL_
 from src.utils.resource_manager import FrameBuffer, ResourceTracker, get_global_tracker
 from src.utils.healthcheck import HealthCheck, BuiltInHealthChecks
 from src.utils.watchdog import Watchdog, RecoveryStrategy, RecoveryAction
-from src.utils.logger import get_logger
+from src.utils.logger import get_logger, shutdown_logging
+from src.visualization import MultiCameraViewer
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Disable OpenCV logging in production mode
-modo = os.getenv('MODO', 'production').lower()
-if modo != 'development':
+modo = os.getenv('MODO', 'production').lower()  # ← Verifica MODO antes de carregar .env
+IS_PRODUCTION = modo == 'production'
+
+if IS_PRODUCTION:
     cv2.setLogLevel(0)  # Disable all OpenCV logging
     os.environ['OPENCV_LOG_LEVEL'] = 'SILENT'
-    # NOTE: stderr redirection disabled - it causes deadlock with logger initialization
-    # The logger system handles output management properly
-    print("[INFO] Production mode: OpenCV logging disabled", flush=True)
+    print("[INFO] Production mode: OpenCV logging disabled, optimizations enabled", flush=True)
 else:
-    # In development mode, keep warnings but mark them as debug info
-    print("Debug: OpenCV warnings will be displayed")
+    print("Debug: Development mode - full logging enabled", flush=True)
+
+# Frame skipping configuration (production optimization)
+FRAME_SKIP = 2 if IS_PRODUCTION else 0  # Skip 2 of every 3 frames in production
 
 
 class ShutdownManager:
@@ -89,32 +92,55 @@ class TrafficLightController:
         self.camera_a: Optional[CameraSource] = None
         self.camera_b: Optional[CameraSource] = None
         
-        # Initialize resource tracking
+        # Initialize resource tracking (minimal in production)
         self.resource_tracker = get_global_tracker()
         
-        # Initialize frame buffers for each camera with rotation
-        self.frame_buffer_a = FrameBuffer(
-            max_frames=100,
-            output_dir='detection_frames/camera_a',
-            max_memory_mb=50,
-            jpeg_quality=85
-        )
-        self.frame_buffer_b = FrameBuffer(
-            max_frames=100,
-            output_dir='detection_frames/camera_b',
-            max_memory_mb=50,
-            jpeg_quality=85
-        )
+        # Frame skipping optimization
+        self.frame_skip_counter = 0
+        self.skip_frames = FRAME_SKIP
+        
+        # Initialize frame buffers ONLY if not production (saves I/O and memory)
+        if not IS_PRODUCTION:
+            self.frame_buffer_a = FrameBuffer(
+                max_frames=100,
+                output_dir='detection_frames/camera_a',
+                max_memory_mb=50,
+                jpeg_quality=85
+            )
+            self.frame_buffer_b = FrameBuffer(
+                max_frames=100,
+                output_dir='detection_frames/camera_b',
+                max_memory_mb=50,
+                jpeg_quality=85
+            )
+        else:
+            self.frame_buffer_a = None
+            self.frame_buffer_b = None
 
-        # Initialize car identifiers with HYBRID detection (Custom SVM + CV fallback)
-        # Custom SVM: detects static cars (even without movement)
-        # CV Fallback: detects movement when SVM fails
-        print("[TRACE] Creating car_identifier_a (hybrid mode)...", flush=True)
-        self.car_identifier_a = create_car_identifier('rpi' if IS_RASPBERRY_PI else 'desktop', use_custom_model=True, use_ml=False)
-        print("[TRACE] Creating car_identifier_b (hybrid mode)...", flush=True)
-        self.car_identifier_b = create_car_identifier('rpi' if IS_RASPBERRY_PI else 'desktop', use_custom_model=True, use_ml=False)
-        print("[TRACE] Car identifiers created", flush=True)
-
+        # FIX: Carregar settings e usar modelo customizado otimizado
+        from src.settings import get_settings
+        settings = get_settings()
+        
+        # Initialize car identifiers com configuração atualizada
+        print("[INFO] Creating car identifiers with OPTIMIZED custom model...")
+        self.car_identifier_a = create_car_identifier(
+            'rpi' if IS_RASPBERRY_PI else 'desktop',
+            use_custom_model=settings.detection.use_custom_model,  # TRUE
+            use_ml=settings.detection.use_ml_model,                 # FALSE
+            use_tflite=settings.detection.use_tflite                # FALSE
+        )
+        
+        self.car_identifier_b = create_car_identifier(
+            'rpi' if IS_RASPBERRY_PI else 'desktop',
+            use_custom_model=settings.detection.use_custom_model,
+            use_ml=settings.detection.use_ml_model,
+            use_tflite=settings.detection.use_tflite
+        )
+        
+        print("[INFO] Using OPTIMIZED custom model (.pkl)")
+        print(f"[INFO] Model path: {settings.detection.custom_model_path}")
+        print(f"[INFO] Confidence threshold: {settings.detection.min_confidence}")
+        
         # Initialize separate visualization identifiers to avoid threading conflicts
         print("[TRACE] Creating vis_identifier_a (hybrid mode)...", flush=True)
         self.vis_identifier_a = create_car_identifier('rpi' if IS_RASPBERRY_PI else 'desktop', use_custom_model=True, use_ml=False)
@@ -146,13 +172,13 @@ class TrafficLightController:
         # Performance tracking
         self.cycle_count = 0
         self.start_time = None
+        self.last_gc_time = time.time()  # For garbage collection scheduling
 
-        # Visualization threads
-        self.vis_thread_a = None
-        self.vis_thread_b = None
-        self.vis_running_a = False
-        self.vis_running_b = False
-        self.threads = []  # Track all threads for cleanup
+        # New simplified visualization system
+        self.camera_viewer = MultiCameraViewer()
+        # Enable visualization if VISUALIZATION_ENABLED=true in .env OR in development mode
+        visualization_env = os.getenv('VISUALIZATION_ENABLED', 'false').lower()
+        self.enable_visualization = (visualization_env == 'true') or (not IS_PRODUCTION)
 
         # Health monitoring
         self.health_check = HealthCheck(max_failures=3)
@@ -181,7 +207,7 @@ class TrafficLightController:
         self.vis_running_b = False
     
     def _setup_health_checks(self):
-        """Setup health monitoring checks"""
+        """Setup health monitoring checks (optimized intervals for production)"""
         try:
             # Memory health check
             self.health_check.register_check(
@@ -191,25 +217,28 @@ class TrafficLightController:
                 critical=False
             )
             
-            # Disk space health check
-            self.health_check.register_check(
-                'disk_space',
-                BuiltInHealthChecks.create_disk_health_check(min_free_gb=0.5),
-                description="Available disk space",
-                critical=False
-            )
+            # Disk space health check (only if frame buffers enabled)
+            if not IS_PRODUCTION:
+                self.health_check.register_check(
+                    'disk_space',
+                    BuiltInHealthChecks.create_disk_health_check(min_free_gb=0.5),
+                    description="Available disk space",
+                    critical=False
+                )
             
             self.logger.info("Health checks configured")
         except Exception as e:
             self.logger.warning(f"Failed to setup some health checks: {e}")
     
     def _start_watchdog(self):
-        """Start watchdog monitoring system"""
+        """Start watchdog monitoring system (optimized intervals)"""
         try:
             # Create watchdog with shutdown callback
+            # Production: longer intervals (60s vs 30s) for reduced overhead
+            check_interval = 60 if IS_PRODUCTION else 30
             self.watchdog = Watchdog(
                 health_check=self.health_check,
-                check_interval=30,
+                check_interval=check_interval,
                 shutdown_callback=lambda: self.shutdown_manager.request_shutdown()
             )
             
@@ -353,14 +382,16 @@ class TrafficLightController:
                 # Start watchdog after cameras are initialized
                 self._start_watchdog()
                 
-                # Start visualization threads in both modes
-                print(f"{'Debug' if debug_mode else 'Info'}: Starting visualization threads")
-                if debug_mode:
-                    print(f"Debug: MODO env var = '{os.getenv('MODO', 'NOT_SET')}'")
-                    print(f"Debug: MODE env var = '{os.getenv('MODE', 'NOT_SET')}'")
-                    print(f"Debug: DISPLAY env var = '{os.getenv('DISPLAY', 'NOT_SET')}'")
-                    print(f"Debug: Has display = {self._has_display()}")
-                self._start_visualization_threads()
+                # Start visualization if enabled
+                if self.enable_visualization:
+                    if self._has_display():
+                        print("✅ Starting camera visualization windows...")
+                        self._start_camera_viewers()
+                    else:
+                        print("❌ Display not detected - visualization disabled")
+                        print("💡 Try: export DISPLAY=:0")
+                else:
+                    print("[INFO] Visualization disabled (set VISUALIZATION_ENABLED=true in .env to enable)")
 
                 return True
 
@@ -528,8 +559,16 @@ class TrafficLightController:
             return False
     
     def run_cycle(self):
-        """Run one complete decision cycle"""
+        """Run one complete decision cycle with frame skipping optimization"""
         try:
+            # Frame skipping logic (production optimization)
+            self.frame_skip_counter += 1
+            should_process = (self.frame_skip_counter % (self.skip_frames + 1)) == 0
+            
+            if not should_process and IS_PRODUCTION:
+                # Skip processing, return last known values
+                return getattr(self, 'last_decision', "A"), getattr(self, 'last_count_a', 0), getattr(self, 'last_count_b', 0)
+            
             # Process both cameras
             count_a = self.process_frame(self.camera_a, self.car_identifier_a, "A")
             count_b = self.process_frame(self.camera_b, self.car_identifier_b, "B")
@@ -543,6 +582,18 @@ class TrafficLightController:
 
             # Update cycle counter
             self.cycle_count += 1
+            
+            # Cache last values for frame skipping
+            self.last_decision = decision
+            self.last_count_a = count_a
+            self.last_count_b = count_b
+            
+            # Periodic garbage collection (every 100 cycles in production)
+            if IS_PRODUCTION and self.cycle_count % 100 == 0:
+                current_time = time.time()
+                if current_time - self.last_gc_time > 60:  # At least 60s between GC
+                    gc.collect()
+                    self.last_gc_time = current_time
 
             return decision, count_a, count_b
 
@@ -684,223 +735,60 @@ class TrafficLightController:
 
     def _has_display(self):
         """Check if graphical display is available"""
-        return 'DISPLAY' in os.environ and os.environ['DISPLAY']
-
-    def _start_visualization_threads(self):
-        """Start background threads for real-time camera visualization"""
-        debug_mode = os.getenv('MODO', '').lower() == 'development'
-
-        if debug_mode:
-            print("Debug: Starting visualization threads for real-time display")
-
-        # Initialize flags for headless mode
-        if not self._has_display():
-            print("Debug: No display detected - saving visualization frames to images")
-            self.frame_saved_a = False
-            self.frame_saved_b = False
-
-        # Start threads based on unique cameras
-        if self.camera_a is self.camera_b:
-            # Same camera for A and B
-            self.vis_running_a = True
-            self.vis_thread_a = threading.Thread(
-                target=self._visualization_loop,
-                args=(self.camera_a, self.vis_identifier_a, "A/B"),
-                daemon=True
-            )
-            self.vis_thread_a.start()
-            print("Debug: Thread for shared camera A/B started")
-        else:
-            # Different cameras
-            self.vis_running_a = True
-            self.vis_thread_a = threading.Thread(
-                target=self._visualization_loop,
-                args=(self.camera_a, self.vis_identifier_a, "A"),
-                daemon=True
-            )
-            self.vis_thread_a.start()
-            print("Debug: Thread A started")
-
-            self.vis_running_b = True
-            self.vis_thread_b = threading.Thread(
-                target=self._visualization_loop,
-                args=(self.camera_b, self.vis_identifier_b, "B"),
-                daemon=True
-            )
-            self.vis_thread_b.start()
-            print("Debug: Thread B started")
-
-        import sys
-        sys.stdout.flush()
-
-    def _visualization_loop(self, camera: CameraSource, car_identifier, camera_name: str):
-        """
-        Continuous real-time visualization of camera feed with detections.
+        mode = os.getenv('MODE', os.getenv('MODO', 'production')).lower()
         
-        Args:
-            camera: CameraSource instance
-            car_identifier: Car detection model instance
-            camera_name: Camera identifier for display
-        """
-        print(f"Debug: Continuous visualization loop started for {camera_name}")
-        import sys
-        sys.stdout.flush()
-        import time
-        start_time = time.time()
-        window_name = f"Detecção IA - Câmera {camera_name}"
-        has_display = self._has_display()
-        frame_count = 0
-
-        if has_display:
-            print(f"Debug: Starting continuous live feed for {camera_name}. Press 'ESC' to close.")
-            cv2.namedWindow(window_name)
-            
-            # Track window with resource tracker
-            self.resource_tracker.track_window(window_name)
-
-        while (self.vis_running_a if camera_name in ["A", "A/B"] else self.vis_running_b) and not self.shutdown_manager.is_shutdown_requested():
-            try:
-                # Capture frame using consistent interface
-                ret, frame = camera.read()
-
-                if not ret or frame is None:
-                    time.sleep(0.1)
-                    continue
-
-                # Run detection and visualization
-                car_count, vis_frame = car_identifier.visualize_detection(frame, show_contours=True)
-
-                # Add camera info
-                h, w = vis_frame.shape[:2]
-                model_status = "🤖 IA ML" if car_identifier.model_loaded else "🔍 CV TRADICIONAL"
-
-                # Background for text
-                cv2.rectangle(vis_frame, (10, 10), (w-10, 60), (0, 0, 0), -1)
-                cv2.rectangle(vis_frame, (10, 10), (w-10, 60), (255, 255, 255), 2)
-
-                # Title and info
-                cv2.putText(vis_frame, f"Câmera {camera_name} - {model_status}",
-                            (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                cv2.putText(vis_frame, f"Detecção em Tempo Real - {car_count} veículo(s)",
-                            (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
-
-                # Instructions
-                if has_display:
-                    cv2.putText(vis_frame, "PRESSIONE 'ESC' para fechar",
-                                (20, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                else:
-                    cv2.putText(vis_frame, "Modo sem display - salvando video",
-                                (20, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-                if has_display:
-                    # Show window continuously
-                    try:
-                        cv2.imshow(window_name, vis_frame)
-                    except Exception as e:
-                        print(f"Debug: Failed to show window {window_name}: {e}")
-                        break
-
-                    # Check if window was closed by user (e.g., clicking X button)
-                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 0:
-                        print(f"Debug: Window {window_name} was closed by user")
-                        if camera_name in ["A", "A/B"]:
-                            self.vis_running_a = False
-                        else:
-                            self.vis_running_b = False
-                        break
-
-                    # Handle key presses continuously, but avoid blocking signals
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == 27:  # ESC key
-                        print(f"Debug: ESC pressed for {camera_name}, closing window")
-                        if camera_name in ["A", "A/B"]:
-                            self.vis_running_a = False
-                        else:
-                            self.vis_running_b = False
-                        break
-                    # Check for shutdown flag more frequently
-                    if self.shutdown_manager.is_shutdown_requested():
-                        print(f"Debug: Shutdown requested, exiting visualization loop for {camera_name}")
-                        break
-                    if not (self.vis_running_a if camera_name in ["A", "A/B"] else self.vis_running_b):
-                        print(f"Debug: Shutdown flag detected for {camera_name}, exiting visualization loop")
-                        break
-                else:
-                    # Headless mode: save frame to image (once for static images)
-                    vis_frame_resized = cv2.resize(vis_frame, (640, 480))
-
-                    if not getattr(self, f'frame_saved_{camera_name.lower()}', False):
-                        output_path = f'camera_{camera_name}_frame.jpg'
-                        try:
-                            success = cv2.imwrite(output_path, vis_frame_resized)
-                            if success:
-                                print(f"Debug: Frame saved successfully for camera {camera_name} at {output_path}")
-                                setattr(self, f'frame_saved_{camera_name.lower()}', True)
-                            else:
-                                print(f"Debug: Failed to save frame for camera {camera_name}")
-                        except Exception as e:
-                            print(f"Debug: Error saving frame for camera {camera_name}: {e}")
-
-                    # Print status occasionally
-                    frame_count += 1
-                    if frame_count % 30 == 0:  # Every ~3 seconds at 10 FPS
-                        print(f"Câmera {camera_name}: {car_count} veículo(s) detectado(s)")
-
-                    time.sleep(0.1)  # Control loop speed
-
-            except Exception as e:
-                print(f"Erro na visualização da câmera {camera_name}: {e}")
-                import traceback
-                traceback.print_exc()
-                time.sleep(0.5)
-
-        elapsed = time.time() - start_time
-        print(f"Debug: Continuous visualization for camera {camera_name} ran for {elapsed:.2f} seconds")
-
-        if has_display:
-            self.resource_tracker.destroy_window(window_name)
-
-    def _create_visualization(self, frame, car_identifier, camera_name, car_count):
-        """Create visualization of car detection and save annotated frames with rotation"""
+        # In development mode, always assume display is available
+        if mode == 'development':
+            return True
+        
+        # Check for actual display
         try:
-            debug_mode = os.getenv('MODO', '').lower() == 'development'
-
-            # Create visualization with bounding boxes
-            car_count_vis, vis_frame_with_boxes = car_identifier.visualize_detection(frame, show_contours=True)
-
-            # Use FrameBuffer for automatic rotation and disk space management
-            frame_buffer = self.frame_buffer_a if camera_name == 'A' else self.frame_buffer_b
-            saved_path = frame_buffer.save_current(vis_frame_with_boxes, camera_name, self.cycle_count)
+            display = os.environ.get('DISPLAY', '')
+            session_type = os.environ.get('XDG_SESSION_TYPE', '')
             
-            if saved_path and debug_mode:
-                print(f"Debug: 📸 Frame anotado salvo: {saved_path}")
+            # If DISPLAY is set or we're in a graphical session
+            has_display = bool(display) or session_type in ['x11', 'wayland']
             
-            # Log memory usage periodically
-            if self.cycle_count % 100 == 0:
-                stats_a = self.frame_buffer_a.get_memory_usage()
-                stats_b = self.frame_buffer_b.get_memory_usage()
-                print(f"Frame Buffer Stats - A: {stats_a.get('disk_frames', 0)} frames, "
-                      f"B: {stats_b.get('disk_frames', 0)} frames")
-
+            # If not set, try to auto-detect common display
+            if not has_display and os.path.exists('/tmp/.X11-unix'):
+                os.environ['DISPLAY'] = ':0'
+                has_display = True
+            
+            return has_display
         except Exception as e:
-            if debug_mode:
-                print(f"Debug: Erro na criação de visualização: {e}")
-            else:
-                print(f"Erro na criação de visualização: {e}")
+            return False
 
-    def _close_windows_on_user_input(self):
-        """Allow user to close windows gracefully"""
-        print("\n📱 Janelas gráficas abertas!")
-        print("💡 Pressione Ctrl+C novamente para fechar tudo")
-        print("⏰ Ou aguarde alguns segundos...")
+    def _start_camera_viewers(self):
+        """Start camera viewers using the new simplified system"""
+        try:
+            # Get FPS from settings
+            fps = CAMERA_SETTINGS.get('fps', 10)
+            
+            # Add camera A
+            self.camera_viewer.add_camera(
+                camera_id="A",
+                camera_source=self.camera_a,
+                detector=self.vis_identifier_a,
+                fps=fps
+            )
+            
+            # Add camera B if different from A
+            if self.camera_a != self.camera_b:
+                self.camera_viewer.add_camera(
+                    camera_id="B",
+                    camera_source=self.camera_b,
+                    detector=self.vis_identifier_b,
+                    fps=fps
+                )
+            
+            print("✅ Camera visualization started successfully")
+            print("💡 Press ESC in any window to close all viewers")
+            
+        except Exception as e:
+            print(f"❌ Error starting camera viewers: {e}")
+            import traceback
+            traceback.print_exc()
 
-        # Give user time to see the content
-        import time
-        time.sleep(3)
-
-        # Auto-close after short delay
-        cv2.destroyAllWindows()
-        print("✅ Janelas gráficas fechadas")
     
     def verify_cleanup(self) -> bool:
         """
@@ -926,12 +814,8 @@ class TrafficLightController:
         except Exception:
             checks['windows_closed'] = True  # No windows if check fails
         
-        # Check threads stopped
-        alive_threads = [t for t in self.threads if t and t.is_alive()]
-        checks['threads_stopped'] = len(alive_threads) == 0
-        
-        if alive_threads:
-            self.logger.warning(f"Threads still alive: {[t.name for t in alive_threads]}")
+        # Check camera viewers stopped
+        checks['viewers_stopped'] = not self.camera_viewer.is_any_running()
         
         all_clean = all(checks.values())
         self.logger.info(f"Cleanup verification: {checks}")
@@ -949,31 +833,21 @@ class TrafficLightController:
             except Exception as e:
                 self.logger.error(f"Error stopping watchdog: {e}")
 
-        # Stop visualization threads
-        self.vis_running_a = False
-        self.vis_running_b = False
-        
-        threads_to_stop = []
-        if self.vis_thread_a and self.vis_thread_a.is_alive():
-            threads_to_stop.append(('Thread A', self.vis_thread_a))
-        if self.vis_thread_b and self.vis_thread_b.is_alive():
-            threads_to_stop.append(('Thread B', self.vis_thread_b))
-        
-        for name, thread in threads_to_stop:
-            self.logger.info(f"Waiting for {name} to stop...")
-            thread.join(timeout=2.0)
-            if thread.is_alive():
-                self.logger.warning(f"{name} did not stop within timeout")
-            else:
-                self.logger.info(f"{name} stopped successfully")
-
-        # Clear frame buffers
+        # Stop camera viewers
         try:
-            self.frame_buffer_a.clear()
-            self.frame_buffer_b.clear()
-            self.logger.info("Frame buffers cleared")
+            self.logger.info("Stopping camera viewers...")
+            self.camera_viewer.stop_all()
         except Exception as e:
-            self.logger.error(f"Error clearing frame buffers: {e}")
+            self.logger.error(f"Error stopping camera viewers: {e}")
+
+        # Clear frame buffers (if they exist - not in production)
+        if self.frame_buffer_a and self.frame_buffer_b:
+            try:
+                self.frame_buffer_a.clear()
+                self.frame_buffer_b.clear()
+                self.logger.info("Frame buffers cleared")
+            except Exception as e:
+                self.logger.error(f"Error clearing frame buffers: {e}")
 
         # Close all OpenCV windows
         try:
@@ -1008,6 +882,12 @@ class TrafficLightController:
         except Exception as e:
             self.logger.error(f"Error releasing tracked resources: {e}")
         
+        # Shutdown async logging
+        try:
+            shutdown_logging()
+        except Exception as e:
+            self.logger.error(f"Error shutting down logging: {e}")
+        
         # Verify cleanup
         cleanup_ok = self.verify_cleanup()
         if cleanup_ok:
@@ -1027,13 +907,14 @@ class TrafficLightController:
             avg_b = self.car_identifier_b.get_average_processing_time()
             print(f"  Tempo médio processamento - Câmera A: {avg_a:.3f}s, Câmera B: {avg_b:.3f}s")
             
-            # Print frame buffer statistics
-            stats_a = self.frame_buffer_a.get_memory_usage()
-            stats_b = self.frame_buffer_b.get_memory_usage()
-            print(f"  Frames salvos - Câmera A: {stats_a.get('disk_frames', 0)}, "
-                  f"Câmera B: {stats_b.get('disk_frames', 0)}")
-            print(f"  Espaço em disco - A: {stats_a.get('disk_size_mb', 0):.1f}MB, "
-                  f"B: {stats_b.get('disk_size_mb', 0):.1f}MB")
+            # Print frame buffer statistics (if available - dev mode only)
+            if self.frame_buffer_a and self.frame_buffer_b:
+                stats_a = self.frame_buffer_a.get_memory_usage()
+                stats_b = self.frame_buffer_b.get_memory_usage()
+                print(f"  Frames salvos - Câmera A: {stats_a.get('disk_frames', 0)}, "
+                      f"Câmera B: {stats_b.get('disk_frames', 0)}")
+                print(f"  Espaço em disco - A: {stats_a.get('disk_size_mb', 0):.1f}MB, "
+                      f"B: {stats_b.get('disk_size_mb', 0):.1f}MB")
             
             # Print health monitoring statistics
             if self.watchdog:
@@ -1058,10 +939,9 @@ def main_teste():
         print("✓ Câmeras inicializadas com sucesso")
         print("📺 Janelas de visualização abertas. Pressione 'ESC' nas janelas para fechar.")
 
-        # Keep visualization running until all windows are closed or ESC is pressed
+        # Keep visualization running until all windows are closed
         try:
-            while controller.vis_running_a or controller.vis_running_b:
-                time.sleep(0.1)  # Keep main thread alive
+            controller.camera_viewer.wait_until_closed()
         except KeyboardInterrupt:
             print("\nInterrupção pelo usuário")
 

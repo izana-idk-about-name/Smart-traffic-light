@@ -1,12 +1,16 @@
 """
-Simple, Functional Logging System for Smart Traffic Light Project
+Optimized Logging System for Smart Traffic Light Project
 
-Simplified version without complex threading locks that cause deadlocks.
+Production-optimized with async logging, unified output, and minimal overhead.
 """
 
 import logging
 import sys
+import os
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
+from queue import Queue
+from logging.handlers import QueueHandler, QueueListener
 
 # Simple global logger cache
 _loggers = {}
@@ -15,10 +19,17 @@ _loggers = {}
 DEFAULT_LOG_DIR = 'logs'
 DEFAULT_LOG_LEVEL = 'INFO'
 
+# Production mode detection
+IS_PRODUCTION = os.getenv('MODE', os.getenv('MODO', 'production')).lower() == 'production'
+
+# Async logging components (production only)
+_log_queue = None
+_queue_listener = None
+
 
 def get_logger(name: str, level: str = None) -> logging.Logger:
     """
-    Get or create a simple logger
+    Get or create an optimized logger with async support in production
     
     Args:
         name: Logger name
@@ -27,6 +38,8 @@ def get_logger(name: str, level: str = None) -> logging.Logger:
     Returns:
         Logger instance
     """
+    global _log_queue, _queue_listener
+    
     # Return cached logger if exists
     if name in _loggers:
         return _loggers[name]
@@ -38,30 +51,64 @@ def get_logger(name: str, level: str = None) -> logging.Logger:
     
     # Avoid duplicate handlers
     if not logger.handlers:
-        # Console handler
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.INFO)
-        
-        # Simple formatter
+        # Simple formatter (no colors in production for performance)
         formatter = logging.Formatter(
             '[%(asctime)s] [%(levelname)-8s] [%(name)s] %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
         
-        # Optional file handler
-        try:
-            log_dir = Path(DEFAULT_LOG_DIR)
-            log_dir.mkdir(parents=True, exist_ok=True)
+        if IS_PRODUCTION:
+            # PRODUCTION MODE: Async logging with unified file
+            if _log_queue is None:
+                _log_queue = Queue(-1)  # Unlimited queue
+                
+                # Single unified log file with rotation
+                log_dir = Path(DEFAULT_LOG_DIR)
+                log_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Larger rotation (50MB instead of 10MB)
+                file_handler = RotatingFileHandler(
+                    log_dir / 'traffic_light.log',
+                    maxBytes=50*1024*1024,  # 50MB
+                    backupCount=3  # Keep only 3 backups
+                )
+                file_handler.setFormatter(formatter)
+                
+                # Start queue listener (async logging)
+                _queue_listener = QueueListener(_log_queue, file_handler, respect_handler_level=True)
+                _queue_listener.start()
             
-            file_handler = logging.FileHandler(log_dir / 'traffic_light.log')
-            file_handler.setLevel(logging.DEBUG)
-            file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
-        except Exception:
-            # Silently fail if can't create file handler
-            pass
+            # Use queue handler for async logging
+            queue_handler = QueueHandler(_log_queue)
+            logger.addHandler(queue_handler)
+            
+            # Minimal console output in production (errors only)
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(logging.ERROR)
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
+        else:
+            # DEVELOPMENT MODE: Synchronous logging with colors
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(logging.DEBUG)
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
+            
+            # File handler for development
+            try:
+                log_dir = Path(DEFAULT_LOG_DIR)
+                log_dir.mkdir(parents=True, exist_ok=True)
+                
+                file_handler = RotatingFileHandler(
+                    log_dir / 'traffic_light.log',
+                    maxBytes=10*1024*1024,  # 10MB
+                    backupCount=5
+                )
+                file_handler.setLevel(logging.DEBUG)
+                file_handler.setFormatter(formatter)
+                logger.addHandler(file_handler)
+            except Exception:
+                pass
     
     # Cache and return
     _loggers[name] = logger
@@ -114,6 +161,14 @@ class LogContext:
         return False
 
 
+def shutdown_logging():
+    """Shutdown async logging gracefully (production only)"""
+    global _queue_listener
+    if _queue_listener:
+        _queue_listener.stop()
+        _queue_listener = None
+
+
 if __name__ == '__main__':
     # Self-test
     logger = get_logger('test', 'DEBUG')
@@ -122,3 +177,4 @@ if __name__ == '__main__':
     logger.warning("Warning message")
     logger.error("Error message")
     print("Logger test complete!")
+    shutdown_logging()

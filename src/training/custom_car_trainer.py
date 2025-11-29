@@ -1,477 +1,554 @@
 #!/usr/bin/env python3
 """
-Treinamento personalizado leve para detecção de carros
-Usa OpenCV ML (SVM) com features HOG - otimizado para Raspberry Pi
+Treinamento OTIMIZADO para detecção de carros de brinquedo
+Versão melhorada com múltiplas features e SVM rigoroso
 """
 
 import cv2
 import numpy as np
 import os
 import random
+import sys
 from pathlib import Path
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
 import pickle
 import time
 from typing import List, Tuple
-from src.training.data_validator import TrainingDataValidator, validate_dataset_quick
 
-class LightweightCarTrainer:
+# FIX: Adicionar raiz do projeto ao path
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+from src.training.data_validator import TrainingDataValidator
+
+class OptimizedCarTrainer:
+    """
+    Trainer otimizado para carros de brinquedo pequenos
+    Usa múltiplas features: HOG + Cor + Textura + Forma
+    """
+    
     def __init__(self, data_dir='data'):
         self.data_dir = Path(data_dir)
+        
+        # FIX 1: HOG otimizado para CARROS (horizontal, pequenos)
         self.hog = cv2.HOGDescriptor(
-            _winSize=(64, 128),
-            _blockSize=(16, 16),
-            _blockStride=(8, 8),
-            _cellSize=(8, 8),
+            _winSize=(64, 48),      # Formato horizontal para carros
+            _blockSize=(8, 8),      # Blocos menores para objetos pequenos
+            _blockStride=(4, 4),    # Stride menor = mais detalhes
+            _cellSize=(4, 4),       # Células menores = mais precisão
             _nbins=9
         )
+        
+        # FIX 2: SVM com parâmetros RIGOROSOS
+        self.svm = SVC(
+            kernel='rbf',
+            C=1000.0,              # Muito rigoroso
+            gamma='scale',         # Auto-ajuste
+            probability=True,      # Para ter confiança
+            class_weight='balanced', # Balanceamento automático
+            cache_size=500         # Performance
+        )
+        
+        # FIX 3: Normalização de features (crítico!)
+        self.scaler = StandardScaler()
+        
+        # Performance tracking
+        self.feature_extraction_time = []
 
-        # Initialize SVM with optimized parameters for RPi
-        self.svm = cv2.ml.SVM_create()
-        self.svm.setType(cv2.ml.SVM_C_SVC)
-        self.svm.setKernel(cv2.ml.SVM_RBF)
-        self.svm.setC(10.0)  # Aumenta a penalidade para erros
-        self.svm.setGamma(0.01)  # Menor gamma para maior generalização
-        self.svm.setTermCriteria((cv2.TERM_CRITERIA_MAX_ITER, 10000, 1e-6))
-
-    def extract_hog_features(self, image_path: str) -> np.ndarray:
-        """Extract HOG features from image with robust preprocessing for real KITTI data"""
+    def extract_multi_features(self, image_path: str) -> np.ndarray:
+        """
+        Extração de MÚLTIPLAS features para melhor detecção
+        
+        Features combinadas:
+        1. HOG - Forma e gradientes
+        2. Histogramas de cor HSV - Cores dos carros
+        3. Textura LBP - Padrões de superfície
+        4. Features geométricas - Proporções
+        """
         try:
+            start_time = time.time()
+            
+            # Carregar imagem
             image = cv2.imread(str(image_path))
-            if image is None or image.size == 0:
+            if image is None:
                 return None
 
-            # Convert to grayscale
-            if len(image.shape) == 3:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = image
-
-            # Ensure minimum size - resize if too small
-            if gray.shape[0] < 64 or gray.shape[1] < 64:
-                # Resize to minimum 64x64
-                gray = cv2.resize(gray, (max(64, gray.shape[1]), max(64, gray.shape[0])), interpolation=cv2.INTER_LINEAR)
-
-            # For real KITTI images, apply different preprocessing
-            if 'kitti' in str(image_path).lower() or str(image_path).endswith('.png'):
-                # KITTI images are already good quality, less aggressive preprocessing
-                blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-                enhanced = blurred
-            else:
-                # For synthetic/toy images, use CLAHE enhancement
-                blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                enhanced = clahe.apply(blurred)
-
-            # Resize to standard size (keeping aspect ratio)
-            h, w = enhanced.shape
-            if h > w:
-                new_h = 128
-                new_w = int(w * (128 / h))
-            else:
-                new_w = 128
-                new_h = int(h * (128 / w))
-
-            # Ensure minimum dimensions
-            new_w = max(new_w, 64)
-            new_h = max(new_h, 64)
-
-            resized = cv2.resize(enhanced, (new_w, new_h))
-
-            # Pad to 128x128 if necessary
-            if resized.shape[0] < 128 or resized.shape[1] < 128:
-                padded = np.zeros((128, 128), dtype=np.uint8)
-                h_pad = (128 - resized.shape[0]) // 2
-                w_pad = (128 - resized.shape[1]) // 2
-                padded[h_pad:h_pad+resized.shape[0], w_pad:w_pad+resized.shape[1]] = resized
-                final_image = padded
-            else:
-                final_image = resized
-
-            # Extract HOG features
-            features = self.hog.compute(final_image)
-
-            if features is None or len(features) == 0:
+            # Converter para diferentes espaços de cor
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            
+            # ==== FEATURE 1: HOG (Histograma de Gradientes Orientados) ====
+            # Redimensionar para tamanho padrão
+            target_size = (96, 64)  # Largura > Altura para carros
+            resized_gray = cv2.resize(gray, target_size)
+            
+            # Aplicar CLAHE para melhorar contraste
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+            enhanced = clahe.apply(resized_gray)
+            
+            # Extrair HOG
+            hog_features = self.hog.compute(enhanced)
+            if hog_features is None:
                 return None
-
-            return features.flatten()
-
+            hog_features = hog_features.flatten()
+            
+            # ==== FEATURE 2: Histogramas de Cor HSV ====
+            resized_hsv = cv2.resize(hsv, target_size)
+            
+            # Histograma de Hue (matiz) - 16 bins
+            hist_h = cv2.calcHist([resized_hsv], [0], None, [16], [0, 180])
+            # Histograma de Saturation (saturação) - 16 bins
+            hist_s = cv2.calcHist([resized_hsv], [1], None, [16], [0, 256])
+            # Histograma de Value (valor) - 16 bins
+            hist_v = cv2.calcHist([resized_hsv], [2], None, [16], [0, 256])
+            
+            # FIX: Normalizar histogramas COM PROTEÇÃO
+            color_features = np.concatenate([
+                hist_h.flatten(),
+                hist_s.flatten(),
+                hist_v.flatten()
+            ])
+            
+            # CRÍTICO: Proteger divisão por zero
+            color_sum = color_features.sum()
+            if color_sum > 0:
+                color_features = color_features / color_sum
+            else:
+                color_features = np.zeros_like(color_features)  # Fallback
+            
+            # ==== FEATURE 3: LBP (Local Binary Patterns) - Textura ====
+            def compute_lbp(image, P=8, R=1):
+                """Compute LBP features"""
+                lbp = np.zeros_like(image)
+                for i in range(R, image.shape[0] - R):
+                    for j in range(R, image.shape[1] - R):
+                        center = image[i, j]
+                        code = 0
+                        for p in range(P):
+                            angle = 2 * np.pi * p / P
+                            x = int(i + R * np.cos(angle))
+                            y = int(j + R * np.sin(angle))
+                            if x >= 0 and x < image.shape[0] and y >= 0 and y < image.shape[1]:
+                                if image[x, y] >= center:
+                                    code |= (1 << p)
+                        lbp[i, j] = code
+                return lbp
+            
+            lbp_image = compute_lbp(resized_gray)
+            lbp_hist = cv2.calcHist([lbp_image.astype(np.uint8)], [0], None, [32], [0, 256])
+            lbp_features = lbp_hist.flatten()
+            # FIX: LBP com proteção
+            lbp_sum = lbp_features.sum()
+            if lbp_sum > 0:
+                lbp_features = lbp_features / lbp_sum
+            else:
+                lbp_features = np.zeros_like(lbp_features)
+            
+            # ==== FEATURE 4: Features Geométricas ====
+            # Detecção de bordas
+            edges = cv2.Canny(resized_gray, 50, 150)
+            edge_density = np.sum(edges > 0) / max(edges.shape[0] * edges.shape[1], 1)  # FIX
+            
+            # Contornos
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                largest_contour = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(largest_contour)
+                perimeter = cv2.arcLength(largest_contour, True)
+                
+                # FIX: Proteção em todas as divisões
+                if area > 0:
+                    compactness = (perimeter ** 2) / area
+                else:
+                    compactness = 0
+                
+                x, y, w, h = cv2.boundingRect(largest_contour)
+                if h > 0:
+                    aspect_ratio = w / h
+                else:
+                    aspect_ratio = 1.0
+                
+                if w > 0 and h > 0:
+                    extent = area / (w * h)
+                else:
+                    extent = 0
+            else:
+                compactness = 0
+                aspect_ratio = 1.0
+                extent = 0
+            
+            geometric_features = np.array([
+                edge_density,
+                compactness,
+                aspect_ratio,
+                extent,
+                len(contours)  # Número de contornos
+            ])
+            
+            # FIX: Momentos com proteção
+            moments = cv2.moments(edges)
+            hu_moments = cv2.HuMoments(moments).flatten()
+            # Log transform com proteção contra log(0)
+            hu_moments = -np.sign(hu_moments) * np.log10(np.abs(hu_moments) + 1e-10)  # FIX: 1e-10
+            
+            # ==== COMBINAR TODAS AS FEATURES ====
+            combined_features = np.concatenate([
+                hog_features,           # ~3000 features
+                color_features,         # 48 features
+                lbp_features,          # 32 features
+                geometric_features,     # 5 features
+                hu_moments             # 7 features
+            ])
+            
+            extraction_time = time.time() - start_time
+            self.feature_extraction_time.append(extraction_time)
+            
+            return combined_features.astype(np.float32)
+            
         except Exception as e:
-            # Return None on any error instead of crashing
+            print(f"⚠️  Erro ao processar {image_path}: {e}")
             return None
 
-    def load_training_data(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Load and prepare training data with proper positive/negative balance"""
+    def load_balanced_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Carregar dados com balanceamento RIGOROSO
+        """
         features = []
         labels = []
 
-        # Load car images (positive samples)
-        car_files = []
-        carro_dir = self.data_dir / 'kitti' / 'images_real' / 'toy_car'
-        if carro_dir.exists():
-            # Recursively find all image files in the carro directory and subdirectories
-            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp', '*.avif']:
-                car_files.extend(list(carro_dir.rglob(ext)))
+        # ==== POSITIVOS (Carros) ====
+        positive_files = []
+        car_dirs = [
+            self.data_dir / 'kitti' / 'images_real' / 'toy_car',
+            self.data_dir / 'kitti' / 'images_real' / 'toy_f1'
+        ]
+        
+        for car_dir in car_dirs:
+            if car_dir.exists():
+                for ext in ['*.jpg', '*.png', '*.jpeg']:
+                    positive_files.extend(list(car_dir.rglob(ext)))
 
-        # Load toy_f1 images (positive samples)
-        toy_f1_dir = self.data_dir / 'kitti' / 'images_real' / 'toy_f1'
-        if toy_f1_dir.exists():
-            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp', '*.avif']:
-                car_files.extend(list(toy_f1_dir.rglob(ext)))
+        print(f"📸 Encontrados {len(positive_files)} arquivos de carros")
 
-        if car_files:
-            # For KITTI data, use more samples since they're high quality
-            if any('kitti' in str(f).lower() or str(f).endswith('.png') for f in car_files[:10]):
-                max_images = len(car_files)  # Use all KITTI images
-                print("🎯 KITTI dataset detectado - usando todas as imagens disponíveis!")
-            else:
-                # For synthetic/toy data, limit to 1/4
-                max_images = len(car_files) // 4
+        # Limitar positivos (evitar overfitting)
+        max_positives = 400
+        if len(positive_files) > max_positives:
+            positive_files = random.sample(positive_files, max_positives)
+            print(f"   Limitando a {max_positives} carros")
 
-            car_files_subset = random.sample(car_files, min(max_images, len(car_files)))
-            print(f"📸 Loading {len(car_files_subset)} car images (POSITIVE samples)...")
-            valid_car_count = 0
-            for i, img_path in enumerate(car_files_subset):
-                feat = self.extract_hog_features(str(img_path))
-                if feat is not None:
-                    features.append(feat)
-                    labels.append(1)  # Car = 1
-                    valid_car_count += 1
-                else:
-                    print(f"⚠️  Skipping invalid car image: {img_path}")
+        positive_count = 0
+        for i, img_path in enumerate(positive_files):
+            feat = self.extract_multi_features(str(img_path))
+            if feat is not None:
+                features.append(feat)
+                labels.append(1)  # Carro
+                positive_count += 1
+            
+            if (i + 1) % 50 == 0:
+                print(f"   Carros: {i + 1}/{len(positive_files)} ({(i+1)/len(positive_files)*100:.1f}%)")
 
-                # Print progress every 500 images
-                if (i + 1) % 500 == 0:
-                    progress = (i + 1) / len(car_files_subset) * 100
-                    print(f"   Progress: {progress:.1f}%")
-            print(f"✅ Valid car images loaded: {valid_car_count}")
+        print(f"✅ Carregados {positive_count} carros válidos")
 
-        # Load NEGATIVE samples (images WITHOUT cars) from data/negativo/
-        negativo_dir = self.data_dir / 'negativo'
+        # ==== NEGATIVOS (Sem carros) ====
         negative_files = []
+        negative_dirs = [
+            self.data_dir / 'negativo',
+            self.data_dir / 'negativo_camera',
+            self.data_dir / 'negativo_synthetic',
+            self.data_dir / 'imagens_originais'
+        ]
+
+        for neg_dir in negative_dirs:
+            if neg_dir.exists():
+                for ext in ['*.jpg', '*.png', '*.jpeg']:
+                    negative_files.extend(list(neg_dir.glob(ext)))
+
+        print(f"📸 Encontrados {len(negative_files)} arquivos negativos")
+
+        # Balanceamento 2:1 (mais negativos para robustez)
+        target_negatives = positive_count * 2
         
-        if negativo_dir.exists():
-            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp', '*.avif']:
-                negative_files.extend(list(negativo_dir.glob(ext)))
+        if len(negative_files) < positive_count:
+            print(f"\n❌ ERRO: Apenas {len(negative_files)} negativos vs {positive_count} positivos")
+            print(f"   MÍNIMO necessário: {positive_count} negativos")
+            print(f"   RECOMENDADO: {target_negatives} negativos")
+            print(f"\n💡 Execute: python3 scripts/capture_negative_samples.py")
+            raise ValueError("Dados insuficientes - capture mais negativos!")
+        
+        if len(negative_files) > target_negatives:
+            negative_files = random.sample(negative_files, target_negatives)
+
+        negative_count = 0
+        for i, img_path in enumerate(negative_files):
+            feat = self.extract_multi_features(str(img_path))
+            if feat is not None:
+                features.append(feat)
+                labels.append(0)  # Sem carro
+                negative_count += 1
             
-            print(f"📸 Loading {len(negative_files)} NEGATIVE samples from data/negativo/...")
-            valid_negative_count = 0
-            for i, img_path in enumerate(negative_files):
-                feat = self.extract_hog_features(str(img_path))
-                if feat is not None:
-                    features.append(feat)
-                    labels.append(0)  # No car = 0
-                    valid_negative_count += 1
-                else:
-                    print(f"⚠️  Skipping invalid negative image: {img_path}")
-                
-                # Print progress every 10 images
-                if (i + 1) % 10 == 0:
-                    progress = (i + 1) / len(negative_files) * 100
-                    print(f"   Progress: {progress:.1f}%")
-            print(f"✅ Valid negative images loaded: {valid_negative_count}")
+            if (i + 1) % 50 == 0:
+                print(f"   Negativos: {i + 1}/{len(negative_files)} ({(i+1)/len(negative_files)*100:.1f}%)")
+
+        print(f"✅ Carregados {negative_count} negativos válidos")
         
-        # Load NEGATIVE samples from camera captures (data/negativo_camera/)
-        negativo_camera_dir = self.data_dir / 'negativo_camera'
-        if negativo_camera_dir.exists():
-            camera_negative_files = []
-            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp', '*.avif']:
-                camera_negative_files.extend(list(negativo_camera_dir.glob(ext)))
-            
-            if camera_negative_files:
-                print(f"📸 Loading {len(camera_negative_files)} NEGATIVE samples from camera...")
-                for i, img_path in enumerate(camera_negative_files):
-                    feat = self.extract_hog_features(str(img_path))
-                    if feat is not None:
-                        features.append(feat)
-                        labels.append(0)  # No car = 0
-                        valid_negative_count += 1
-                    
-                    # Print progress every 10 images
-                    if (i + 1) % 10 == 0:
-                        progress = (i + 1) / len(camera_negative_files) * 100
-                        print(f"   Progress: {progress:.1f}%")
-                print(f"✅ Camera negative images loaded: {len(camera_negative_files)}")
-
-        # Also load background images from imagens_originais (if they exist)
-        bg_dir = self.data_dir / 'imagens_originais'
-        if bg_dir.exists():
-            bg_files = []
-            for ext in ['*.jpg', '*.png', '*.jpeg', '*.webp', '*.avif']:
-                bg_files.extend(list(bg_dir.glob(ext)))
-
-            if bg_files:
-                print(f"📸 Loading {len(bg_files)} additional background images...")
-                for i, img_path in enumerate(bg_files):
-                    feat = self.extract_hog_features(str(img_path))
-                    if feat is not None:
-                        features.append(feat)
-                        labels.append(0)  # Background = 0
-
-                    # Print progress every 100 images
-                    if (i + 1) % 100 == 0:
-                        progress = (i + 1) / len(bg_files) * 100
-                        print(f"   Progress: {progress:.1f}%")
-
-        if len(features) == 0:
-            raise ValueError("❌ No training images found!")
-
-        # Show class distribution
-        unique, counts = np.unique(labels, return_counts=True)
-        print(f"\n📊 Class Distribution:")
-        for cls, count in zip(unique, counts):
-            class_name = "CARS (positive)" if cls == 1 else "NO CARS (negative)"
-            print(f"   {class_name}: {count} samples")
+        # Validação de balanceamento
+        ratio = negative_count / positive_count
+        print(f"\n📊 BALANCEAMENTO:")
+        print(f"   Positivos: {positive_count}")
+        print(f"   Negativos: {negative_count}")
+        print(f"   Razão: {ratio:.2f}:1")
         
+        if ratio < 1.0:
+            raise ValueError("❌ Dataset desbalanceado! Capture mais negativos.")
+        elif ratio < 1.5:
+            print("⚠️  Balanceamento mínimo - recomendado 2:1")
+        else:
+            print("✅ Dataset bem balanceado!")
+
         return np.array(features), np.array(labels)
 
-    def augment_data(self, features: np.ndarray, labels: np.ndarray,
-                    augmentation_factor: int = 4) -> Tuple[np.ndarray, np.ndarray]:
-        """Data augmentation: noise, flip, scale"""
-        augmented_features = []
-        augmented_labels = []
+    def optimize_hyperparameters(self, X_train, y_train):
+        """
+        Otimização automática de hiperparâmetros com GridSearch
+        """
+        print("\n🔧 Otimizando hiperparâmetros do SVM...")
+        
+        param_grid = {
+            'C': [100, 500, 1000, 2000],
+            'gamma': ['scale', 'auto', 0.001, 0.0001],
+            'kernel': ['rbf']
+        }
+        
+        grid_search = GridSearchCV(
+            SVC(probability=True, class_weight='balanced'),
+            param_grid,
+            cv=3,  # 3-fold cross-validation
+            scoring='f1',
+            n_jobs=-1,  # Usar todos os cores
+            verbose=1
+        )
+        
+        grid_search.fit(X_train, y_train)
+        
+        print(f"✅ Melhores parâmetros encontrados:")
+        print(f"   C: {grid_search.best_params_['C']}")
+        print(f"   Gamma: {grid_search.best_params_['gamma']}")
+        print(f"   Score: {grid_search.best_score_:.3f}")
+        
+        return grid_search.best_estimator_
 
-        for feat, label in zip(features, labels):
-            # Original sample
-            augmented_features.append(feat)
-            augmented_labels.append(label)
+    def train_model(self, test_size: float = 0.25, optimize_params: bool = True):
+        """
+        Treinar modelo otimizado
+        """
+        print("🚗 Iniciando treinamento OTIMIZADO para carros de brinquedo")
+        print("=" * 60)
 
-            # Add noise variations
-            for _ in range(augmentation_factor - 1):
-                noise = np.random.normal(0, 0.08, feat.shape)
-                noisy_feat = feat + noise
-                augmented_features.append(noisy_feat)
-                augmented_labels.append(label)
+        # Carregar dados balanceados
+        features, labels = self.load_balanced_data()
+        
+        print(f"\n📊 Dataset final: {len(features)} amostras")
+        unique, counts = np.unique(labels, return_counts=True)
+        for cls, count in zip(unique, counts):
+            name = "Carros" if cls == 1 else "Negativos"
+            print(f"   {name}: {count} ({count/len(labels)*100:.1f}%)")
 
-            # Flip (simulado via reversão dos vetores HOG)
-            flipped_feat = feat[::-1]
-            augmented_features.append(flipped_feat)
-            augmented_labels.append(label)
-
-            # Scale (simulado via multiplicação)
-            scaled_feat = feat * np.random.uniform(0.9, 1.1, feat.shape)
-            augmented_features.append(scaled_feat)
-            augmented_labels.append(label)
-
-        return np.array(augmented_features), np.array(augmented_labels)
-
-    def train_model(self, test_size: float = 0.3, validate_data: bool = True):
-        """Train the SVM model with optional data validation"""
-        print("🚗 Starting lightweight car detection training...")
-
-        # Validate training data if requested
-        if validate_data:
-            print("\n🔍 Validating training data before training...")
-            try:
-                validator = TrainingDataValidator(
-                    min_samples_per_class=50,  # Reasonable minimum for SVM
-                    min_image_width=32,
-                    min_image_height=32,
-                    max_class_imbalance=10.0,
-                    check_duplicates=True
-                )
-                
-                # Validate car data
-                car_dir = self.data_dir / 'kitti' / 'images_real'
-                if car_dir.exists():
-                    result = validator.validate_dataset(str(car_dir), class_dirs=['toy_car', 'toy_f1'])
-                    
-                    print(f"\n{'='*60}")
-                    print("Validação dos Dados de Treinamento")
-                    print(f"{'='*60}")
-                    print(f"Total: {result.total_samples} | Válidos: {result.valid_samples}")
-                    print(f"Status: {'✅ VÁLIDO' if result.is_valid else '⚠️  COM AVISOS'}")
-                    
-                    if result.warnings:
-                        print("\n⚠️  Avisos:")
-                        for warning in result.warnings[:3]:
-                            print(f"  - {warning}")
-                    
-                    if result.errors:
-                        print("\n❌ Erros Críticos:")
-                        for error in result.errors:
-                            print(f"  - {error}")
-                        print("\n🛑 Treinamento cancelado devido a erros nos dados")
-                        print("💡 Corrija os erros e tente novamente")
-                        return None, None
-                    
-                    if result.valid_samples < 50:
-                        print(f"\n⚠️  Apenas {result.valid_samples} amostras válidas encontradas")
-                        print("   Recomendado: pelo menos 100 amostras para treinamento robusto")
-                        print("   Continuando, mas resultados podem ser limitados...")
-                    
-                    print(f"{'='*60}\n")
-                
-            except Exception as e:
-                print(f"⚠️  Erro na validação: {e}")
-                print("   Continuando com treinamento (sem validação)...")
-
-        # Load data
-        features, labels = self.load_training_data()
-        print(f"📊 Dataset: {len(features)} samples, {np.sum(labels==1)} cars, {np.sum(labels==0)} background")
-
-        # Data augmentation
-        features, labels = self.augment_data(features, labels, augmentation_factor=3)
-        print(f"📊 After augmentation: {len(features)} samples")
-
-        # Split data
+        # Split estratificado
         X_train, X_test, y_train, y_test = train_test_split(
-            features, labels, test_size=test_size, random_state=42
+            features, labels,
+            test_size=test_size,
+            random_state=42,
+            stratify=labels  # Manter proporção
         )
 
-        print(f"📊 Training set: {len(X_train)} samples")
-        print(f"📊 Test set: {len(X_test)} samples")
+        print(f"\n📊 Split:")
+        print(f"   Treino: {len(X_train)} ({len(X_train)/len(features)*100:.0f}%)")
+        print(f"   Teste: {len(X_test)} ({len(X_test)/len(features)*100:.0f}%)")
 
-        # Convert data types for OpenCV SVM
-        X_train = X_train.astype(np.float32)
-        y_train = y_train.astype(np.int32)
+        # CRÍTICO: Normalizar features
+        print("\n🔧 Normalizando features (StandardScaler)...")
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
 
-        # Train SVM
-        print("🚗 Training SVM model...")
-        start_time = time.time()
-        self.svm.train(X_train, cv2.ml.ROW_SAMPLE, y_train)
-        training_time = time.time() - start_time
-        print("✅ SVM training completed!")
+        # Otimizar hiperparâmetros
+        if optimize_params:
+            self.svm = self.optimize_hyperparameters(X_train_scaled, y_train)
+        else:
+            # Treinar com parâmetros fixos
+            print("\n🚗 Treinando SVM...")
+            start_time = time.time()
+            self.svm.fit(X_train_scaled, y_train)
+            training_time = time.time() - start_time
+            print(f"✅ Treinamento concluído em {training_time:.2f}s")
 
-        print(".2f")
-        # Convert test data type
-        X_test = X_test.astype(np.float32)
+        # Avaliar
+        print("\n📊 AVALIAÇÃO:")
+        
+        # Treino
+        train_pred = self.svm.predict(X_train_scaled)
+        train_acc = np.mean(train_pred == y_train)
+        print(f"   Acurácia Treino: {train_acc*100:.1f}%")
+        
+        # Teste
+        test_pred = self.svm.predict(X_test_scaled)
+        test_acc = np.mean(test_pred == y_test)
+        print(f"   Acurácia Teste: {test_acc*100:.1f}%")
+        
+        # Verificar overfitting
+        if train_acc - test_acc > 0.1:
+            print(f"\n⚠️  ALERTA: Possível overfitting ({(train_acc-test_acc)*100:.1f}% diferença)")
+        
+        # Relatório detalhado
+        print(f"\n📋 Relatório de Classificação:")
+        print(classification_report(y_test, test_pred,
+                                   target_names=['Sem Carro', 'Com Carro'],
+                                   digits=3))
 
-        # Evaluate
-        _, predictions = self.svm.predict(X_test)
-        predictions = predictions.flatten().astype(int)
+        # Matriz de confusão
+        cm = confusion_matrix(y_test, test_pred)
+        print(f"\n🎯 Matriz de Confusão:")
+        print(f"                 Previsto")
+        print(f"              Neg     Pos")
+        print(f"Real   Neg   {cm[0,0]:4d}    {cm[0,1]:4d}   (Verdadeiro Neg | Falso Pos)")
+        print(f"       Pos   {cm[1,0]:4d}    {cm[1,1]:4d}   (Falso Neg | Verdadeiro Pos)")
+        
+        # Análise de erros
+        false_positives = cm[0, 1]
+        false_negatives = cm[1, 0]
+        print(f"\n📉 Análise de Erros:")
+        print(f"   Falsos Positivos: {false_positives} ({false_positives/cm[0].sum()*100:.1f}% dos negativos)")
+        print(f"   Falsos Negativos: {false_negatives} ({false_negatives/cm[1].sum()*100:.1f}% dos positivos)")
 
-        # Calculate accuracy
-        accuracy = np.mean(predictions == y_test)
-        print(".2f")
-        # Save model
+        # Salvar modelo
         self.save_model()
+        
+        # Performance
+        if self.feature_extraction_time:
+            avg_feat_time = np.mean(self.feature_extraction_time)
+            print(f"\n⏱️  Performance:")
+            print(f"   Extração de features: {avg_feat_time*1000:.1f}ms por imagem")
 
-        return accuracy, training_time
+        return test_acc
 
-    def save_model(self, filename='src/models/custom_car_detector.yml'):
-        """Save trained SVM model"""
-        self.svm.save(str(filename))
-        print(f"💾 Model saved to {filename}")
+    def save_model(self, filename='src/models/custom_car_detector_optimized.pkl'):
+        """Salvar modelo completo"""
+        model_data = {
+            'svm': self.svm,
+            'scaler': self.scaler,
+            'hog_params': {
+                'winSize': (64, 48),
+                'blockSize': (8, 8),
+                'blockStride': (4, 4),
+                'cellSize': (4, 4),
+                'nbins': 9
+            }
+        }
+        
+        Path(filename).parent.mkdir(parents=True, exist_ok=True)
+        with open(filename, 'wb') as f:
+            pickle.dump(model_data, f)
+        print(f"\n💾 Modelo salvo em {filename}")
+        print(f"   Tamanho: {Path(filename).stat().st_size / 1024:.1f} KB")
 
-    def load_model(self, filename='src/models/custom_car_detector.yml'):
-        """Load trained SVM model"""
-        if os.path.exists(filename):
-            self.svm = cv2.ml.SVM_load(filename)
-            return True
-        return False
-
-    def predict(self, image_path: str) -> Tuple[int, float]:
-        """Predict if image contains a car with better error handling"""
+    def load_model(self, filename='src/models/custom_car_detector_optimized.pkl'):
+        """Carregar modelo completo"""
         try:
-            features = self.extract_hog_features(image_path)
-            if features is None or len(features) == 0:
-                return -1, 0.0  # Error indicator
+            with open(filename, 'rb') as f:
+                model_data = pickle.load(f)
+            
+            self.svm = model_data['svm']
+            self.scaler = model_data['scaler']
+            
+            # Recriar HOG
+            params = model_data['hog_params']
+            self.hog = cv2.HOGDescriptor(
+                _winSize=params['winSize'],
+                _blockSize=params['blockSize'],
+                _blockStride=params['blockStride'],
+                _cellSize=params['cellSize'],
+                _nbins=params['nbins']
+            )
+            
+            return True
+        except Exception as e:
+            print(f"❌ Erro ao carregar: {e}")
+            return False
 
-            _, result = self.svm.predict(features.reshape(1, -1))
-            confidence = float(result[0][0])
+    def predict(self, image_path: str, threshold: float = 0.75) -> Tuple[int, float]:
+        """
+        Predição com threshold RIGOROSO
+        
+        Args:
+            image_path: Caminho da imagem
+            threshold: Limiar de decisão (padrão 0.75 - rigoroso)
+        
+        Returns:
+            (predição, confiança)
+        """
+        try:
+            # Extrair features
+            features = self.extract_multi_features(image_path)
+            if features is None:
+                return 0, 0.0
 
-            # Use lower threshold for recall, but return confidence for post-processing
-            return int(confidence > 0.5), confidence
+            # Normalizar
+            features_scaled = self.scaler.transform(features.reshape(1, -1))
+            
+            # Predição com probabilidade
+            probabilities = self.svm.predict_proba(features_scaled)[0]
+            car_probability = probabilities[1]
+            
+            # Decisão com threshold rigoroso
+            prediction = int(car_probability > threshold)
+            
+            return prediction, car_probability
 
         except Exception as e:
-            # Return error indicator instead of crashing
-            return -1, 0.0
+            print(f"⚠️  Erro: {e}")
+            return 0, 0.0
 
-def create_synthetic_background_samples(num_samples: int = 50):
-    """Create synthetic background samples for better training"""
-    print(f"🎨 Creating {num_samples} synthetic background samples...")
-
-    bg_dir = Path('data/imagens_originais')
-    bg_dir.mkdir(exist_ok=True)
-
-    for i in range(num_samples):
-        # Create random noise image
-        noise = np.random.randint(0, 256, (128, 128, 3), dtype=np.uint8)
-        filename = f"synthetic_bg_{i:04d}.jpg"
-        cv2.imwrite(str(bg_dir / filename), noise)
-
-    print("✅ Synthetic background samples created!")
 
 def main():
-    """Main training function"""
-    print("🔧 Lightweight Car Detection Trainer for Raspberry Pi")
-    print("=" * 50)
+    """Função principal"""
+    print("🎯 Optimized Car Trainer - Versão Melhorada")
+    print("=" * 60)
 
-    trainer = LightweightCarTrainer()
+    trainer = OptimizedCarTrainer()
 
-    # Check if training data exists
-    carro_dir = Path('data/kitti/images_real/toy_car')
-    if not carro_dir.exists() or len(list(carro_dir.rglob('*'))) == 0:
-        print("❌ No car training images found!")
-        print("📸 Please add car images to data/kitti/images_real/toy_car/")
+    # Verificar dados
+    car_dir = Path('data/kitti/images_real/toy_car')
+    if not car_dir.exists():
+        print("❌ Diretório de carros não encontrado!")
         return
 
-    # Create background samples if needed
-    bg_dir = Path('data/imagens_originais')
-    if not bg_dir.exists() or len(list(bg_dir.glob('*'))) < 10:
-        print("⚠️  Limited background samples. Creating synthetic ones...")
-        create_synthetic_background_samples()
+    neg_dir = Path('data/negativo')
+    if not neg_dir.exists():
+        print("❌ Capture amostras negativas primeiro!")
+        print("   Execute: python3 scripts/capture_negative_samples.py")
+        return
 
-    # Train model with validation
     try:
-        result = trainer.train_model(validate_data=True)
-        if result is None or result[0] is None:
-            print("\n❌ Training aborted due to data validation errors")
-            print("💡 Fix the data issues and try again")
-            return
+        # FIX: Treinar SEM otimização de hiperparâmetros (muito mais rápido)
+        print("\n⚡ Modo rápido: usando parâmetros pré-otimizados")
+        accuracy = trainer.train_model(optimize_params=False)  # ← MUDANÇA AQUI
         
-        accuracy, training_time = result
-        print("\n✅ Training completed successfully!")
-        print(f"📊 Final Accuracy: {accuracy*100:.2f}%")
-        print(f"⏱️  Training Time: {training_time:.2f}s")
-        print("💡 This model is optimized for Raspberry Pi performance!")
-        print("🔄 You can now use it in your car detection system!")
+        if accuracy > 0.90:
+            print(f"\n🎉 EXCELENTE! Precisão: {accuracy*100:.1f}%")
+        elif accuracy > 0.85:
+            print(f"\n✅ BOM! Precisão: {accuracy*100:.1f}%")
+        else:
+            print(f"\n⚠️  Precisão baixa: {accuracy*100:.1f}%")
+            print("   Capture mais dados e retreine")
+            
     except Exception as e:
-        print(f"❌ Training failed: {e}")
+        print(f"❌ Erro: {e}")
         import traceback
         traceback.print_exc()
 
-def demo_camera_detection():
-    """Demonstração ao vivo da detecção de carros usando a IA customizada"""
-    import cv2
-    trainer = LightweightCarTrainer()
-    if not trainer.load_model():
-        print("❌ Modelo não encontrado. Treine antes de rodar a demo.")
-        return
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("❌ Não foi possível abrir a câmera.")
-        return
-    print("🔴 Pressione ESC para sair.")
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("❌ Falha ao capturar frame da câmera.")
-            break
-        # Salva frame temporário para predição
-        temp_path = "/tmp/frame_demo.jpg"
-        cv2.imwrite(temp_path, frame)
-        pred, conf = trainer.predict(temp_path)
-        label = f"Carro: {'Sim' if pred == 1 else 'Não'} ({conf:.2f})"
-        color = (0, 255, 0) if pred == 1 else (0, 0, 255)
-        cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-        # cv2.imshow("Detecção de Carro (IA Customizada)", frame)
-        # Se não houver suporte a GUI, salve o frame com resultado
-        out_path = "/tmp/frame_demo_result.jpg"
-        cv2.imwrite(out_path, frame)
-        print(f"Frame salvo em {out_path} | {label}")
-        # Sem waitKey, apenas salva frames continuamente
-    cap.release()
-    # cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "demo":
-        demo_camera_detection()
-    else:
-        main()
-
-if __name__ == "__main__":
-    exit(main())
+    main()

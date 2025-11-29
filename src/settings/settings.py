@@ -6,7 +6,7 @@ Provides a single source of truth for all configuration settings with validation
 import os
 import platform
 from dataclasses import dataclass, field, asdict
-from typing import Literal, Optional
+from typing import Literal, Optional, List
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -132,27 +132,27 @@ class DetectionSettings:
     enable_tracking: bool
     model_path: str
     labels_path: str
+    custom_model_path: str  # NEW: Path para modelo customizado
     max_results: int
-    car_classes: list[str]
-    
-    # CV fallback settings
+    car_classes: List[str]
     use_fallback_cv: bool
     background_history: int
     var_threshold: int
     min_car_area: int
-    
+
     @classmethod
     def from_env(cls, is_rpi: bool) -> 'DetectionSettings':
         """Create DetectionSettings from environment variables"""
         return cls(
-            use_tflite=_get_env_bool('USE_TFLITE', True),
-            use_ml_model=_get_env_bool('USE_ML_MODEL', True),
-            use_custom_model=_get_env_bool('USE_CUSTOM_MODEL', True),
-            min_confidence=_get_env_float('MIN_CONFIDENCE', 0.5, min_val=0.0, max_val=1.0),
+            use_tflite=_get_env_bool('USE_TFLITE', False),
+            use_ml_model=_get_env_bool('USE_ML_MODEL', False),
+            use_custom_model=_get_env_bool('USE_CUSTOM_MODEL', True),  # Default TRUE
+            min_confidence=_get_env_float('MIN_CONFIDENCE', 0.75, min_val=0.0, max_val=1.0),
             reset_interval_seconds=_get_env_int('RESET_INTERVAL_SECONDS', 30, min_val=1),
             enable_tracking=_get_env_bool('ENABLE_TRACKING', True),
             model_path=os.getenv('MODEL_PATH', 'src/models/efficientdet_lite2.tflite'),
             labels_path=os.getenv('LABELS_PATH', 'src/models/coco_labels.txt'),
+            custom_model_path=os.getenv('CUSTOM_MODEL_PATH', 'src/models/custom_car_detector_optimized.pkl'),  # NEW
             max_results=_get_env_int('MAX_RESULTS', 10 if is_rpi else 15, min_val=1, max_val=100),
             car_classes=['car', 'truck', 'bus'],
             use_fallback_cv=_get_env_bool('USE_FALLBACK_CV', True),

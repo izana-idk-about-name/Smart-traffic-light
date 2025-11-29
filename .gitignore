@@ -223,3 +223,18 @@ data/**/*.jpg
 data/**/*.jpeg
 data/**/*.png
 data/ 
+
+# Project specific
+detection_frames/
+*.log
+
+# Model files
+*.pkl
+*.h5
+*.pth
+*.pt
+*.onnx
+*.tflite
+src/models/*.pkl
+src/models/*.h5
+.env

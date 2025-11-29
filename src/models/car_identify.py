@@ -2,16 +2,38 @@ import cv2
 import numpy as np
 import time
 import threading
+import os
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
 from src.settings.rpi_config import MODEL_SETTINGS
-from src.training.custom_car_trainer import LightweightCarTrainer
-from src.models.tflite_car_detector import TFLiteCarDetector
 from src.utils.logger import get_logger
 from src.settings.settings import get_settings
 from src.utils.resource_manager import TempFileManager
 
 from collections import deque
+
+# Production mode detection
+IS_PRODUCTION = os.getenv('MODE', os.getenv('MODO', 'production')).lower() == 'production'
+
+# Lazy imports (only load when needed)
+_OptimizedCarTrainer = None
+_TFLiteCarDetector = None
+
+def _get_optimized_trainer():
+    """Lazy import OptimizedCarTrainer"""
+    global _OptimizedCarTrainer
+    if _OptimizedCarTrainer is None:
+        from src.training.custom_car_trainer import OptimizedCarTrainer
+        _OptimizedCarTrainer = OptimizedCarTrainer
+    return _OptimizedCarTrainer
+
+def _get_tflite_detector():
+    """Lazy import TFLiteCarDetector"""
+    global _TFLiteCarDetector
+    if _TFLiteCarDetector is None:
+        from src.models.tflite_car_detector import TFLiteCarDetector
+        _TFLiteCarDetector = TFLiteCarDetector
+    return _TFLiteCarDetector
 
 class CarTracker:
     """
@@ -78,19 +100,13 @@ class CarTracker:
 class CarIdentifier:
     def __init__(self, optimize_for_rpi=True, use_ml=True, use_custom_model=False, use_tflite=False):
         """
-        Initialize car identifier with AI/ML capabilities.
+        Initialize car identifier with multiple detection strategies
         
-        Thread Safety:
-            - Uses RLock for recursive locking support
-            - All shared state access is protected by locks
-            - Lock acquisition has timeout to prevent deadlocks
-            - Logs lock contention for performance monitoring
- 
         Args:
-            optimize_for_rpi: Whether to optimize for Raspberry Pi performance
-            use_ml: Whether to use ML model for detection
-            use_custom_model: Whether to use custom trained SVM model instead of pre-trained
-            use_tflite: Whether to use TFLite optimized model (recommended for RPi)
+            optimize_for_rpi: Use Raspberry Pi optimizations
+            use_ml: Use ML model (MobileNet SSD)
+            use_custom_model: Use custom trained SVM model
+            use_tflite: Use TensorFlow Lite model
         """
         # Initialize logger first
         self.logger = get_logger(__name__)
@@ -125,6 +141,10 @@ class CarIdentifier:
         # Initialize TFLite detector
         self.tflite_detector = None
         self.tflite_loaded = False
+        
+        # Frame resize cache (production optimization)
+        self._resize_cache = {}
+        self._cache_max_size = 10
 
         # Tracker for custom model detections
         self.tracker = CarTracker(tracker_type="KCF", max_lost=10)
@@ -135,7 +155,6 @@ class CarIdentifier:
             self._load_tflite_model()
         elif self.use_custom_model:
             self._load_custom_model()
-            # Don't load ML model when using custom model - custom handles everything
         elif self.use_ml:
             self._load_ml_model()
         
@@ -221,16 +240,31 @@ class CarIdentifier:
         self.lock.release()
         
     def preprocess_frame(self, frame):
-        """Preprocess frame for better detection and performance"""
+        """Preprocess frame with caching for better performance"""
+        frame_key = id(frame)
+        
+        # Check cache first (production optimization)
+        if IS_PRODUCTION and frame_key in self._resize_cache:
+            return self._resize_cache[frame_key]
+        
         if self.optimize_for_rpi:
-            # Resize frame for faster processing on RPi
-            frame = cv2.resize(frame, (320, 240))
+            # Resize frame ONCE for faster processing on RPi
+            frame_resized = cv2.resize(frame, (320, 240))
+        else:
+            frame_resized = frame
         
         # Convert to grayscale for background subtraction
-        if len(frame.shape) == 3:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if len(frame_resized.shape) == 3:
+            gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
         else:
-            gray = frame
+            gray = frame_resized
+        
+        # Cache result (limited cache size)
+        if IS_PRODUCTION:
+            if len(self._resize_cache) >= self._cache_max_size:
+                # Remove oldest entry
+                self._resize_cache.pop(next(iter(self._resize_cache)))
+            self._resize_cache[frame_key] = gray
             
         return gray
 
@@ -367,21 +401,10 @@ class CarIdentifier:
         self.logger.debug(f"[Thread-{thread_id}] New background subtractor created")
     
     def get_average_processing_time(self):
-        """
-        Get average processing time per frame (thread-safe).
-        
-        Returns:
-            float: Average processing time in seconds
-        """
-        if not self._acquire_lock_with_timeout("get_average_processing_time"):
-            return 0.0
-        
-        try:
-            if self.frame_count == 0:
-                return 0.0
+        """Get average frame processing time"""
+        if self.frame_count > 0:
             return self.total_processing_time / self.frame_count
-        finally:
-            self._release_lock("get_average_processing_time")
+        return 0.0
     
     def reset_metrics(self):
         """
@@ -516,7 +539,8 @@ class CarIdentifier:
     def _load_tflite_model(self):
         """Load TFLite optimized car detection model (called during init, no lock needed)"""
         try:
-            self.tflite_detector = TFLiteCarDetector()
+            TFLiteDetectorClass = _get_tflite_detector()
+            self.tflite_detector = TFLiteDetectorClass()
             if self.tflite_detector.interpreter is not None:
                 self.tflite_loaded = True
                 self.logger.info("TFLite optimized model loaded successfully")
@@ -533,22 +557,77 @@ class CarIdentifier:
             self._load_custom_model()
 
     def _load_custom_model(self):
-        """Load custom trained SVM model for car detection (called during init, no lock needed)"""
+        """Load custom trained SVM model (called during init, no lock needed)"""
         try:
-            self.custom_trainer = LightweightCarTrainer()
-            model_path = 'src/models/custom_car_detector.yml'
+            OptimizedCarTrainerClass = _get_optimized_trainer()
+            
+            # FIX: Carregar novo modelo .pkl em vez de .yml
+            model_path = Path('src/models/custom_car_detector_optimized.pkl')
+            
+            if not model_path.exists():
+                # Fallback para modelo antigo se novo não existir
+                old_model_path = Path('src/models/custom_car_detector.yml')
+                if old_model_path.exists():
+                    self.logger.warning(f"Novo modelo não encontrado em {model_path}")
+                    self.logger.warning(f"Usando modelo antigo: {old_model_path}")
+                    self.logger.warning("RECOMENDADO: Retreine com: python3 src/training/custom_car_trainer.py")
+                    self._load_old_custom_model()  # Fallback para modelo antigo
+                    return
+                else:
+                    self.logger.warning(f"Modelo customizado não encontrado em {model_path}")
+                    self.logger.info("Treine o modelo com: python3 src/training/custom_car_trainer.py")
+                    return
 
-            if self.custom_trainer.load_model(model_path):
+            # Criar trainer e carregar modelo otimizado
+            self.custom_trainer = OptimizedCarTrainerClass()
+            
+            if self.custom_trainer.load_model(str(model_path)):
                 self.custom_model_loaded = True
-                self.logger.info("Custom SVM model loaded successfully")
+                self.logger.info(f"✅ Modelo SVM otimizado carregado de {model_path}")
+                self.logger.info("   Features: HOG + Cor + Textura + Geometria + Momentos")
+                self.logger.info("   SVM: RBF kernel com C=1000.0")
             else:
-                self.logger.warning("Custom model not found. Using fallback CV method.")
-                self.custom_model_loaded = False
-
+                self.logger.error(f"Falha ao carregar modelo customizado de {model_path}")
+                
+        except ImportError as e:
+            self.logger.error(f"Erro ao importar OptimizedCarTrainer: {e}")
+            self.logger.info("Verifique se src/training/custom_car_trainer.py existe")
         except Exception as e:
-            self.logger.error(f"Error loading custom model: {e}. Using fallback CV method.",
-                            exc_info=True)
-            self.custom_model_loaded = False
+            self.logger.error(f"Erro ao carregar modelo customizado: {e}", exc_info=True)
+
+    def _load_old_custom_model(self):
+        """Fallback: Load old .yml custom model"""
+        try:
+            # FIX: Verificar se existe classe LightweightCarTrainer para compatibilidade
+            try:
+                from src.training.custom_car_trainer import LightweightCarTrainer
+                trainer_class = LightweightCarTrainer
+            except ImportError:
+                # Se LightweightCarTrainer não existir, usar OptimizedCarTrainer
+                # (não será capaz de carregar .yml, mas evita erro de import)
+                self.logger.warning("LightweightCarTrainer não encontrado - modelo .yml não suportado")
+                return
+            
+            old_model_path = Path('src/models/custom_car_detector.yml')
+            
+            # Criar trainer antigo
+            self.custom_trainer = trainer_class()
+            
+            # Tentar carregar modelo antigo
+            if hasattr(self.custom_trainer, 'svm') and self.custom_trainer.svm is not None:
+                try:
+                    self.custom_trainer.svm.load(str(old_model_path))
+                    self.custom_model_loaded = True
+                    self.logger.info(f"Modelo SVM antigo (.yml) carregado de {old_model_path}")
+                    self.logger.warning("⚠️  Usando modelo ANTIGO - performance reduzida")
+                    self.logger.warning("   Retreine com: python3 src/training/custom_car_trainer.py")
+                except Exception as e:
+                    self.logger.error(f"Erro ao carregar modelo .yml: {e}")
+            else:
+                self.logger.error("Trainer antigo não inicializado corretamente")
+                
+        except Exception as e:
+            self.logger.error(f"Erro ao carregar modelo antigo: {e}")
 
     def _load_ml_model(self):
         """Load ML model for car detection (called during init, no lock needed)"""
@@ -611,16 +690,18 @@ class CarIdentifier:
             except Exception as e:
                 self.logger.error(f"❌ TFLite model validation failed: {e}")
         
-        # Validate custom SVM model
+        # FIX: Validate custom SVM model - verificar .pkl em vez de .yml
         if self.use_custom_model:
             try:
                 if self.custom_model_loaded and self.custom_trainer is not None:
-                    model_path = Path('src/models/custom_car_detector.yml')
+                    # FIX: Verificar arquivo .pkl otimizado
+                    model_path = Path('src/models/custom_car_detector_optimized.pkl')
                     if model_path.exists():
                         validation['custom_svm'] = True
                         self.logger.info("✅ Custom SVM model validated successfully")
+                        self.logger.info(f"   Model file: {model_path} ({model_path.stat().st_size / 1024:.1f} KB)")
                     else:
-                        self.logger.warning("⚠️  Custom SVM model file not found")
+                        self.logger.warning(f"⚠️  Custom SVM model file not found at {model_path}")
                 else:
                     self.logger.warning("⚠️  Custom SVM model not loaded")
             except Exception as e:
@@ -637,7 +718,7 @@ class CarIdentifier:
             except Exception as e:
                 self.logger.error(f"❌ ML model validation failed: {e}")
         
-        # Log overall validation status
+        # FIX: Log overall validation status corretamente
         active_models = [k for k, v in validation.items() if v and k != 'has_fallback']
         if active_models:
             self.logger.info(f"🎯 Active models: {', '.join(active_models)}")
@@ -679,9 +760,6 @@ class CarIdentifier:
     def _detect_with_custom_model(self, frame):
         """
         Detect cars using custom trained SVM model with improved negative sampling.
-        
-        The model has been retrained with proper negative samples (images without cars)
-        to reduce false positive rate and correctly distinguish car presence/absence.
         """
         if not self.custom_model_loaded or self.custom_trainer is None:
             self.logger.debug("Custom model not loaded, falling back to CV detection")
@@ -689,41 +767,40 @@ class CarIdentifier:
 
         try:
             import tempfile
-            import os
             
             start_time = time.time()
 
-            # Save frame to temporary file for prediction
             with tempfile.NamedTemporaryFile(mode='w+b', suffix='.jpg', delete=False) as temp_file:
                 temp_path = temp_file.name
-                cv2.imwrite(temp_path, frame)
-            
+                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85 if IS_PRODUCTION else 95]
+                cv2.imwrite(temp_path, frame, encode_param)
+        
             try:
-                # Run prediction
-                prediction, confidence = self.custom_trainer.predict(temp_path)
-                
+                # FIX: Reduzir threshold de 0.75 para 0.50 (50% confiança)
+                prediction, confidence = self.custom_trainer.predict(temp_path, threshold=0.50)  # ← MUDANÇA AQUI
+            
                 detection_time = time.time() - start_time
                 self.ml_inference_count += 1
                 self.ml_inference_time += detection_time
-                
-                self.logger.debug(f"Custom SVM prediction: {prediction}, confidence: {confidence:.3f}")
-                
-                # Only return detection if prediction is positive (1 = car present)
+            
+                if not IS_PRODUCTION:
+                    self.logger.debug(f"Custom SVM prediction: {prediction}, confidence: {confidence:.3f}")
+            
                 if prediction == 1:
-                    # Return full-frame detection (the model classifies the whole frame)
                     h, w = frame.shape[:2]
                     car_boxes = [{
-                        'bbox': [int(w*0.1), int(h*0.1), int(w*0.8), int(h*0.8)],  # Approximate car region
+                        'bbox': [int(w*0.1), int(h*0.1), int(w*0.8), int(h*0.8)],
                         'confidence': float(confidence),
                         'class': 'car_custom_svm'
                     }]
-                    self.logger.info(f"Custom SVM detected car with confidence {confidence:.3f}")
+                    if not IS_PRODUCTION:
+                        self.logger.info(f"Custom SVM detected car with confidence {confidence:.3f}")
                     return car_boxes
                 else:
-                    self.logger.debug(f"Custom SVM: No car detected (confidence: {confidence:.3f})")
+                    if not IS_PRODUCTION:
+                        self.logger.debug(f"Custom SVM: No car detected (confidence: {confidence:.3f})")
                     return []
             finally:
-                # Clean up temporary file
                 try:
                     os.unlink(temp_path)
                 except Exception:
@@ -840,7 +917,7 @@ class CarIdentifier:
             x, y, w, h = contour
             cv_boxes.append({
                 'bbox': [x, y, w, h],
-                'confidence': 0.5,  # Very low confidence - extremely conservative
+                'confidence': 0.5,  # Very low confidence - extremamente conservador
                 'class': 'car_cv_conservative'
             })
 
@@ -980,44 +1057,53 @@ class CarIdentifier:
             - Releases all OpenCV resources
         """
         try:
-            if hasattr(self, 'logger'):
+            if hasattr(self, 'logger') and not IS_PRODUCTION:
                 self.logger.info("CarIdentifier cleanup initiated")
+            
+            # Clear resize cache
+            if hasattr(self, '_resize_cache'):
+                self._resize_cache.clear()
             
             # Clean up tracker
             if hasattr(self, 'tracker') and self.tracker:
                 self.tracker.reset()
-                self.logger.debug("Tracker resources released")
+                if hasattr(self, 'logger') and not IS_PRODUCTION:
+                    self.logger.debug("Tracker resources released")
             
             # Clean up background subtractor
             if hasattr(self, 'bg_subtractor') and self.bg_subtractor is not None:
                 del self.bg_subtractor
-                self.logger.debug("Background subtractor released")
+                if hasattr(self, 'logger') and not IS_PRODUCTION:
+                    self.logger.debug("Background subtractor released")
             
             # Clean up ML models
             if hasattr(self, 'ml_model') and self.ml_model is not None:
                 del self.ml_model
-                self.logger.debug("ML model released")
+                if hasattr(self, 'logger') and not IS_PRODUCTION:
+                    self.logger.debug("ML model released")
             
             if hasattr(self, 'tflite_detector') and self.tflite_detector is not None:
                 del self.tflite_detector
-                self.logger.debug("TFLite detector released")
+                if hasattr(self, 'logger') and not IS_PRODUCTION:
+                    self.logger.debug("TFLite detector released")
             
             if hasattr(self, 'custom_trainer') and self.custom_trainer is not None:
                 del self.custom_trainer
-                self.logger.debug("Custom trainer released")
+                if hasattr(self, 'logger') and not IS_PRODUCTION:
+                    self.logger.debug("Custom trainer released")
             
             # Cleanup orphaned temp files
             try:
                 TempFileManager.cleanup_orphaned_files(prefix="svm_detect_", max_age_hours=1)
             except Exception as cleanup_error:
-                if hasattr(self, 'logger'):
+                if hasattr(self, 'logger') and not IS_PRODUCTION:
                     self.logger.debug(f"Temp file cleanup: {cleanup_error}")
             
-            if hasattr(self, 'logger'):
+            if hasattr(self, 'logger') and not IS_PRODUCTION:
                 self.logger.info("CarIdentifier cleanup completed")
         except Exception as e:
             if hasattr(self, 'logger'):
-                self.logger.error(f"Error during cleanup: {e}", exc_info=True)
+                self.logger.error(f"Error during cleanup: {e}", exc_info=not IS_PRODUCTION)
 
 # Factory function for creating optimized car identifier
 def create_car_identifier(mode='rpi', use_ml=True, use_custom_model=False, use_tflite=False):
