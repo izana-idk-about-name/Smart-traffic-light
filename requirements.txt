@@ -1,0 +1,51 @@
+# Sistema de Controle de Semáforos Inteligente
+# Dependências leves otimizadas para Raspberry Pi 4 e Python 3.13
+
+# Core dependencies
+opencv-python>=4.8.1
+numpy>=1.26.0
+Pillow>=10.0.1
+
+# AI/ML models (leve)
+opencv-contrib-python>=4.8.1  # Includes DNN module and ML algorithms
+requests>=2.31.0  # For downloading models
+
+# Image processing
+scipy>=1.11.2
+matplotlib>=3.7.2
+
+# Network communication
+websocket-client>=1.6.3
+
+# Utilities
+python-dotenv>=1.0.0
+psutil>=5.9.5
+
+# Logging
+colorlog>=6.7.0
+
+# Development dependencies (optional)
+pytest>=7.4.2
+pytest-cov>=4.1.0
+
+# Training dependencies leves
+scikit-learn>=1.3.0  # Para algoritmos ML leves
+
+# TensorFlow Lite for lightweight models and quantization
+tensorflow>=2.13.0
+tflite-support>=0.4.4
+tensorflow-model-optimization>=0.7.5  # For pruning and quantization
+
+# Raspberry Pi specific (uncomment if needed)
+# picamera2>=0.3.12  # For Pi Camera Module v2
+# RPi.GPIO>=0.7.1    # For GPIO control
+
+# Performance monitoring
+memory-profiler>=0.61.0
+
+# Optional: For advanced image processing
+# albumentations>=1.3.1  # Uncomment if needed for training
+# imutils>=0.5.4        # Uncomment for additional OpenCV utilities
+
+# Google Images Download for custom image collection
+google_images_download>=2.8.0

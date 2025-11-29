@@ -201,3 +201,40 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local
+passos_projeto.md
+src/Data/
+custom_car_detector.yml
+detection_frames/
+
+# Large data files
+*.zip
+*.tar.gz
+*.rar
+*.7z
+*.tar
+*.gz
+*.bz2
+*.xz
+data/kitti/images.zip
+data/kitti/**/*.zip
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.png
+data/ 
+
+# Project specific
+detection_frames/
+*.log
+
+# Model files
+*.pkl
+*.h5
+*.pth
+*.pt
+*.onnx
+*.tflite
+src/models/*.pkl
+src/models/*.h5
+.env
